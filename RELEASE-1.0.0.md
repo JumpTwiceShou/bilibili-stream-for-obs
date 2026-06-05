@@ -1,0 +1,13 @@
+# bilibili-stream-for-obs 1.0.0
+
+- 首次公开发布 Windows x64 OBS 插件包。
+- 开播时读取当前直播间分区，不再默认覆盖为英雄联盟。
+- 更新直播间信息窗口会读取当前标题和分区，并通过一个“确认修改”按钮同时提交。
+- OBS 原生停止直播后，插件会自动同步关闭 Bilibili 直播间。
+- 遇到 Bilibili 人脸识别时，扫码完成后插件会检测认证状态并自动继续开播。
+- 注意：插件依赖 Bilibili 非官方接口，平台接口调整可能导致部分功能失效。
+
+## 附件
+
+- `bilibili-stream-for-obs-1.0.0-windows-x64.zip`
+- `CHECKSUMS.txt`

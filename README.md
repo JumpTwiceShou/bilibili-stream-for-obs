@@ -1,0 +1,135 @@
+# OBS Bilibili 直播插件
+
+这是一个为 OBS Studio 开发的 Bilibili 开播辅助插件。插件可以在 OBS 菜单中完成扫码登录、读取和更新直播间信息、开启 Bilibili 直播，并获取 RTMP 推流地址和推流码。
+
+本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
+
+## 本版本改动
+
+- 开播时自动读取当前直播间分区，不再默认把直播间分区覆盖为“英雄联盟”。
+- “更新直播间信息”窗口会读取当前直播间标题和分区，并显示到输入框和分区选择框中。
+- “更新直播间信息”只保留一个“确认修改”按钮，一次提交标题和分区。
+- 点击 OBS 原生“停止直播”后，插件会检测 Bilibili 直播状态，并自动同步关闭 B 站直播间。
+- 遇到 Bilibili 人脸识别时，扫码完成后插件会检测认证状态，并自动继续开播。
+
+## 安装方法
+
+### Windows
+
+1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.0.0-windows-x64.zip`。
+2. 解压压缩包。
+3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
+
+   ```text
+   C:\ProgramData\obs-studio\plugins
+   ```
+
+4. 确认目录结构如下：
+
+   ```text
+   C:\ProgramData\obs-studio\plugins\
+   └── bilibili-stream-for-obs\
+       ├── bin\
+       │   └── 64bit\
+       │       └── bilibili-stream-for-obs.dll
+       └── data\
+           └── locale\
+               └── (相关 .ini 语言文件)
+   ```
+
+5. 重启 OBS Studio，菜单栏中出现“Bilibili直播”即代表插件已加载。
+
+## 使用方法
+
+### 1. 登录 Bilibili
+
+1. 打开 OBS Studio。
+2. 在菜单栏选择“Bilibili直播” -> “登录”。
+3. 使用手机 Bilibili App 扫描二维码。
+4. 登录成功后，菜单中的登录状态会显示为“已登录”。
+
+### 2. 更新直播间信息
+
+1. 在菜单栏选择“Bilibili直播” -> “更新直播间信息”。
+2. 插件会先读取当前直播间标题和分区，并显示到窗口中。
+3. 修改标题、主分区或子分区。
+4. 点击“确认修改”，插件会一次提交标题和分区变更。
+
+如果标题或分区没有变化，插件会提示“直播间信息没有变化”。
+
+### 3. 开始直播
+
+1. 在菜单栏选择“Bilibili直播” -> “开始直播”。
+2. 插件会读取当前直播间分区并调用 Bilibili 开播接口。
+3. 开播成功后，弹窗会显示 RTMP 地址和推流码。
+4. 打开 OBS“设置” -> “直播”，按以下方式填写：
+
+   ```text
+   服务：自定义
+   服务器：RTMP 地址
+   推流码：推流码
+   ```
+
+5. 回到 OBS 主界面，点击右下角“开始直播”开始推流。
+
+### 4. 结束直播
+
+推荐直接点击 OBS 右下角“停止直播”。插件检测到 OBS 推流停止后，会自动检查 Bilibili 直播状态，并同步关闭 B 站直播间。
+
+如果自动同步失败，仍可以在菜单栏选择“Bilibili直播” -> “停止直播”手动关闭 Bilibili 直播间。
+
+## 人脸识别说明
+
+如果 Bilibili 开播接口要求人脸识别，插件会显示人脸识别二维码。请使用手机 Bilibili App 扫码完成认证。
+
+认证完成后，插件会轮询人脸识别状态接口；检测到认证通过后，会自动再次调用开播接口，不需要手动重新点击“开始直播”。
+
+注意：人脸识别状态检测使用的是 Bilibili 非官方公开接口，可能会因为平台接口调整而失效。
+
+## 注意事项
+
+- 本插件依赖 Bilibili 直播相关接口，接口变更可能导致登录、开播、停播、更新直播间信息或人脸识别检测失效。
+- 插件会保存登录 Cookie，请只在可信电脑上使用，不要向他人分享 OBS 配置文件或插件日志。
+- 请遵守 Bilibili 平台规则和相关法律法规，使用本插件产生的后果由使用者自行承担。
+- 遇到问题时请先查看 OBS 日志。
+
+OBS 日志位置：
+
+```text
+Windows: C:\Users\<YourUser>\AppData\Roaming\obs-studio\logs
+macOS: ~/Library/Logs/obs-studio/
+Linux: ~/.config/obs-studio/logs/
+```
+
+## 构建说明
+
+Windows 构建需要：
+
+- OBS Studio 30.0 或更高版本。
+- Visual Studio Build Tools，包含 C++ 桌面开发工具链。
+- CMake。
+
+本项目沿用 OBS 插件模板的 CMake 构建流程，OBS、Qt 和预编译依赖由构建配置下载。公开发布包以 GitHub Release 附件为准。
+
+本地 Windows 构建示例：
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64 --parallel
+cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInfo
+```
+
+## 致谢与参考
+
+- [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)：原生 OBS 插件主体和使用方式参考。
+- [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live)：OBS Python 脚本功能参考，尤其是 OBS 前端事件与停播同步思路。
+- [SocialSisterYi/bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)：Bilibili API 资料参考。
+
+## 许可证
+
+本仓库按 GNU General Public License v3.0 发布，详见 [LICENSE](LICENSE)。
+
+第三方组件保持其原许可证：
+
+- `src/json11`：Copyright (c) 2013 Dropbox, Inc.，MIT License。
+- `src/qrcodegen`：Copyright (c) Project Nayuki，MIT License。
