@@ -10,6 +10,11 @@
 !.clang-format
 !.gersemirc
 !.gitignore
+!.gitattributes
+!.env.example
+!AGENTS.md
+!/docs
+!/docs/**
 !buildspec.json
 !CMakeLists.txt
 !CMakePresets.json
