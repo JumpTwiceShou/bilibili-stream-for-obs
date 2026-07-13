@@ -45,12 +45,7 @@ invoke_formatter() {
       local -a formatter_version=($(${formatter} --version))
 
       if ! is-at-least 19.1.1 ${formatter_version[-1]}; then
-        log_error "clang-format is not version 19.1.1 or above (found ${formatter_version[-1]}."
-        exit 2
-      fi
-
-      if ! is-at-least ${formatter_version[-1]} 19.1.1; then
-        log_error "clang-format is more recent than version 19.1.1 (found ${formatter_version[-1]})."
+        log_error "clang-format is not version 19.1.1 or above (found ${formatter_version[-1]})."
         exit 2
       fi
 
@@ -70,11 +65,11 @@ invoke_formatter() {
         local -a command=(${formatter} ${format_args})
 
         for file (${source_files}) {
-            diff_output=$(${command} "${file}" | diff -u "${file}" - 2>&1)
-            log_error "${diff_output}}"
-            if ! ${command} "${file}" | diff -q "${file}" - &> /dev/null; then
+          if ! ${command} "${file}" | diff -q "${file}" - &> /dev/null; then
+            diff_output=$(${command} "${file}" | diff -u "${file}" - 2>&1 || true)
+            log_error "${diff_output}"
             log_error "${file} requires formatting changes."
-            if (( fail_on_error == 2 )) return 2;
+            if (( fail_on_error == 2 )) return 2
             num_failures=$(( num_failures + 1 ))
           fi
         }
@@ -98,9 +93,12 @@ invoke_formatter() {
         local gersemi_version=($(gersemi --version))
 
         if ! is-at-least 0.12.0 ${gersemi_version[2]}; then
-          log_error "gersemi is not version 0.12.0 or above (found ${gersemi_version[2]}."
+          log_error "gersemi is not version 0.12.0 or above (found ${gersemi_version[2]})."
           exit 2
         fi
+      } else {
+        log_error "No viable gersemi version found (required 0.12.0 or above)"
+        exit 2
       }
 
       if (( ! #source_files )) source_files=(CMakeLists.txt (cmake)/**/(CMakeLists.txt|*.cmake)(.N))
@@ -165,7 +163,7 @@ invoke_formatter() {
         for file (${source_files}) {
           if ! "${command}" "${file}" | diff -q "${file}" - &> /dev/null; then
             log_error "${file} requires formatting changes."
-            if (( fail_on_error == 2 )) return 2;
+            if (( fail_on_error == 2 )) return 2
             num_failures=$(( num_failures + 1 ))
           fi
         }

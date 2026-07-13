@@ -9,14 +9,15 @@
 - 开播时自动读取当前直播间分区，不再默认把直播间分区覆盖为“英雄联盟”。
 - “更新直播间信息”窗口会读取当前直播间标题和分区，并显示到输入框和分区选择框中。
 - “更新直播间信息”只保留一个“确认修改”按钮，一次提交标题和分区。
-- 点击 OBS 原生“停止直播”后，插件会检测 Bilibili 直播状态，并自动同步关闭 B 站直播间。
+- 点击 OBS 原生“停止直播”后，插件只会检测并同步关闭由本插件启动、仍处于托管状态的 B 站直播间，不会误关其他设备或流程发起的直播。
 - 遇到 Bilibili 人脸识别时，扫码完成后插件会检测认证状态，并自动继续开播。
+- 登录、开停播、直播间更新和认证轮询都在后台执行，不阻塞 OBS 界面线程。
 
 ## 安装方法
 
 ### Windows
 
-1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.0.0-windows-x64.zip`。
+1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.1.0-windows-x64.zip`。
 2. 解压压缩包。
 3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
 
@@ -47,6 +48,7 @@
 2. 在菜单栏选择“Bilibili直播” -> “登录”。
 3. 使用手机 Bilibili App 扫描二维码。
 4. 登录成功后，菜单中的登录状态会显示为“已登录”。
+5. 需要退出时，选择“Bilibili直播” -> “登录” -> “退出登录”；该操作只清除本插件保存的本地凭据，不会让其他设备退出登录。插件托管直播期间需先停播。
 
 ### 2. 更新直播间信息
 
@@ -89,7 +91,8 @@
 ## 注意事项
 
 - 本插件依赖 Bilibili 直播相关接口，接口变更可能导致登录、开播、停播、更新直播间信息或人脸识别检测失效。
-- 插件会保存登录 Cookie，请只在可信电脑上使用，不要向他人分享 OBS 配置文件或插件日志。
+- 插件把状态保存到当前用户的 OBS 配置目录；Windows 使用 DPAPI 绑定当前用户加密登录 Cookie。macOS/Linux 暂时使用仅当前用户可读写的兼容存储，因此仍应只在可信电脑上使用。
+- 插件不会把登录 Cookie、CSRF 或 RTMP 推流码写入普通日志，也不会持久化 CSRF 或推流码；但分享日志和配置前仍建议检查内容。
 - 请遵守 Bilibili 平台规则和相关法律法规，使用本插件产生的后果由使用者自行承担。
 - 遇到问题时请先查看 OBS 日志。
 
@@ -117,6 +120,14 @@ Windows 构建需要：
 cmake --preset windows-x64
 cmake --build --preset windows-x64 --parallel
 cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInfo
+```
+
+包含离线回归测试的 Windows 验证：
+
+```powershell
+cmake --preset windows-ci-x64
+cmake --build --preset windows-ci-x64 --parallel
+ctest --preset windows-ci-x64
 ```
 
 ## 致谢与参考

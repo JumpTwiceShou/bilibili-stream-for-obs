@@ -7,7 +7,7 @@ namespace Bili {
 namespace {
 const std::string APP_KEY = "aae92bc66f3edfab";
 const std::string APP_SECRET = "af125a0d5279fd576c1b4418a3e8276d";
-}
+} // namespace
 
 struct Config {
 	std::string room_id;
@@ -16,9 +16,7 @@ struct Config {
 	std::string mid;
 	std::string title;
 	bool login_status = false;
-	bool streaming = false;
-	std::string rtmp_addr;
-	std::string rtmp_code;
+	bool managed_session = false;
 	int part_id = 0;
 	int area_id = 0;
 };
@@ -35,20 +33,24 @@ struct RoomInfo {
 
 class BiliApi {
 public:
-	static void init();
+	enum class QrLoginResult { Pending, Scanned, Success, Expired, Error };
+
+	static bool init();
 	static void cleanup();
 	static bool getQrCode(const std::string &cookies, std::string &qr_data, std::string &qr_key,
 			      std::string &message);
-	static bool qrLogin(std::string &qr_key, std::string &cookies, std::string &message);
-	static bool checkLoginStatus(const std::string &cookies, std::string &message, std::string &mid);
+	static QrLoginResult qrLogin(const std::string &qr_key, std::string &cookies, std::string &message);
+	static bool checkLoginStatus(const std::string &cookies, bool &is_logged_in, std::string &message,
+				     std::string &mid);
 	static bool getRoomIdAndCsrf(const std::string &cookies, std::string &room_id, std::string &csrf_token,
 				     std::string &message);
 	static bool getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message);
 	static bool getLiveStatus(const Config &config, bool &is_live, std::string &message);
 	static json11::Json getPartitionList(std::string &message);
 	static bool startLive(Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
-			      std::string &face_qr, std::string &mid);
-	static bool isUserIdentifiedByFaceAuth(const Config &config, bool &is_identified, std::string &message);
+			      std::string &face_qr, int &face_auth_code, std::string &mid);
+	static bool isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
+					       std::string &message);
 	static bool stopLive(const Config &config, std::string &message);
 	static bool updateRoomInfo(const Config &config, const std::string &title, std::string &message);
 	static bool updateRoomArea(const Config &config, int area_id, std::string &message);
