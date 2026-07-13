@@ -55,5 +55,5 @@ runs:
 
         print ::group::Run gersemi
         local -a changes=(${(s:,:)CHANGED_FILES//[\[\]\'\"]/})
-        ./build-aux/run-gersemi --fail-${{ inputs.failCondition }} --check ${changes}
+        zsh ./build-aux/run-gersemi --fail-${{ inputs.failCondition }} --check ${changes}
         print ::endgroup::

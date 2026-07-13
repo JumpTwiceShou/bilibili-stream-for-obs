@@ -1,61 +1,169 @@
 #include "core/config_manager.hpp"
+
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QString>
 #include <obs-module.h>
+
+#include "core/api_utils.hpp"
+#include "core/secret_store.hpp"
+#include "plugin_utils.hpp"
 
 namespace Core {
 ConfigManager::ConfigManager() {}
 
-char *ConfigManager::getConfigPath()
+char *ConfigManager::getConfigPath() const
+{
+	return obs_module_config_path("config.json");
+}
+
+char *ConfigManager::getLegacyConfigPath() const
 {
 	return obs_module_file("config.json");
 }
 
-void ConfigManager::load()
+bool ConfigManager::loadSettings(obs_data_t *settings, bool legacyFormat, std::string &message)
 {
-	m_config = Bili::Config();
-
-	char *configFile = getConfigPath();
-	if (!configFile)
-		return;
-
-	obs_data_t *settings = obs_data_create_from_json_file(configFile);
-	if (!settings) {
-		bfree(configFile);
-		return;
-	}
-
 	m_config.room_id = obs_data_get_string(settings, "room_id");
-	m_config.csrf_token = obs_data_get_string(settings, "csrf_token");
 	m_config.mid = obs_data_get_string(settings, "mid");
-	m_config.cookies = obs_data_get_string(settings, "cookies");
 	m_config.title = obs_data_get_string(settings, "title");
-	m_config.rtmp_addr = obs_data_get_string(settings, "rtmp_addr");
-	m_config.rtmp_code = obs_data_get_string(settings, "rtmp_code");
-	m_config.streaming = obs_data_get_bool(settings, "streaming");
+	m_config.managed_session = obs_data_get_bool(settings, "managed_session") ||
+				   (legacyFormat && obs_data_get_bool(settings, "streaming"));
 	m_config.part_id = static_cast<int>(obs_data_get_int(settings, "part_id"));
 	m_config.area_id = static_cast<int>(obs_data_get_int(settings, "area_id"));
-	obs_data_release(settings);
-	bfree(configFile);
+
+	const std::string protectedCookies = obs_data_get_string(settings, "cookies_protected");
+	if (!protectedCookies.empty()) {
+		if (!unprotectSecret(protectedCookies, m_config.cookies, message)) {
+			return false;
+		}
+	} else if (legacyFormat) {
+		m_config.cookies = obs_data_get_string(settings, "cookies");
+	}
+	m_config.csrf_token = extractCookieValue(m_config.cookies, "bili_jct");
+	return true;
 }
 
-void ConfigManager::save()
+bool ConfigManager::load()
+{
+	m_config = Bili::Config();
+	char *configFile = getConfigPath();
+	if (!configFile) {
+		obs_log(LOG_ERROR, "OBS module configuration directory is unavailable");
+		return false;
+	}
+
+	bool legacyFormat = false;
+	char *legacyFile = nullptr;
+	obs_data_t *settings = obs_data_create_from_json_file(configFile);
+	if (!settings) {
+		legacyFile = getLegacyConfigPath();
+		if (legacyFile) {
+			settings = obs_data_create_from_json_file(legacyFile);
+			legacyFormat = settings != nullptr;
+		}
+	}
+
+	if (!settings) {
+		bfree(legacyFile);
+		bfree(configFile);
+		return true;
+	}
+
+	const std::string storedCookies = obs_data_get_string(settings, "cookies_protected");
+	const bool needsProtectionUpgrade = usesNativeSecretProtection() && storedCookies.rfind("plain-v1:", 0) == 0;
+	std::string message;
+	const bool loaded = loadSettings(settings, legacyFormat, message);
+	obs_data_release(settings);
+	if (!loaded) {
+		obs_log(LOG_ERROR, "Failed to load protected plugin configuration: %s", message.c_str());
+		m_config = Bili::Config();
+		bfree(legacyFile);
+		bfree(configFile);
+		return false;
+	}
+
+	if (legacyFormat || needsProtectionUpgrade) {
+		if (save()) {
+			if (legacyFormat) {
+				sanitizeLegacyConfig(legacyFile);
+				obs_log(LOG_INFO, "Migrated plugin state to the per-user OBS configuration directory");
+			} else {
+				obs_log(LOG_INFO, "Upgraded stored plugin credentials to native protection");
+			}
+		} else {
+			obs_log(LOG_ERROR, "Failed to migrate or upgrade plugin configuration");
+		}
+	} else if (!usesNativeSecretProtection() && !m_config.cookies.empty()) {
+		obs_log(LOG_WARNING,
+			"Native secret protection is unavailable; cookies use the per-user compatibility store");
+	}
+
+	bfree(legacyFile);
+	bfree(configFile);
+	return true;
+}
+
+bool ConfigManager::save()
 {
 	char *configFile = getConfigPath();
-	if (!configFile)
-		return;
+	if (!configFile) {
+		obs_log(LOG_ERROR, "OBS module configuration directory is unavailable");
+		return false;
+	}
+
+	const QString configPath = QString::fromUtf8(configFile);
+	const QString configDirectory = QFileInfo(configPath).absolutePath();
+	if (!QDir().mkpath(configDirectory)) {
+		obs_log(LOG_ERROR, "Failed to create the plugin configuration directory");
+		bfree(configFile);
+		return false;
+	}
+
+	std::string protectedCookies;
+	std::string message;
+	if (!protectSecret(m_config.cookies, protectedCookies, message)) {
+		obs_log(LOG_ERROR, "Failed to protect plugin credentials: %s", message.c_str());
+		bfree(configFile);
+		return false;
+	}
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, "room_id", m_config.room_id.c_str());
-	obs_data_set_string(settings, "csrf_token", m_config.csrf_token.c_str());
-	obs_data_set_string(settings, "cookies", m_config.cookies.c_str());
 	obs_data_set_string(settings, "mid", m_config.mid.c_str());
 	obs_data_set_string(settings, "title", m_config.title.c_str());
-	obs_data_set_string(settings, "rtmp_addr", m_config.rtmp_addr.c_str());
-	obs_data_set_string(settings, "rtmp_code", m_config.rtmp_code.c_str());
-	obs_data_set_bool(settings, "streaming", m_config.streaming);
+	obs_data_set_string(settings, "cookies_protected", protectedCookies.c_str());
+	obs_data_set_bool(settings, "managed_session", m_config.managed_session);
 	obs_data_set_int(settings, "part_id", m_config.part_id);
 	obs_data_set_int(settings, "area_id", m_config.area_id);
-	obs_data_save_json(settings, configFile);
+	const bool saved = obs_data_save_json_safe(settings, configFile, "tmp", "bak");
 	obs_data_release(settings);
+
+	if (saved) {
+		QFile::setPermissions(configPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+	} else {
+		obs_log(LOG_ERROR, "Failed to save plugin configuration");
+	}
 	bfree(configFile);
+	return saved;
+}
+
+void ConfigManager::sanitizeLegacyConfig(const char *legacyPath)
+{
+	if (!legacyPath)
+		return;
+	obs_data_t *settings = obs_data_create_from_json_file(legacyPath);
+	if (!settings)
+		return;
+	obs_data_set_string(settings, "cookies", "");
+	obs_data_set_string(settings, "csrf_token", "");
+	obs_data_set_string(settings, "rtmp_addr", "");
+	obs_data_set_string(settings, "rtmp_code", "");
+	if (!obs_data_save_json_safe(settings, legacyPath, "tmp", "bak")) {
+		obs_log(LOG_WARNING,
+			"Could not redact the legacy plugin data file; remove it manually if it contains credentials");
+	}
+	obs_data_release(settings);
 }
 } // namespace Core

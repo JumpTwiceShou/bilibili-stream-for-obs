@@ -11,7 +11,8 @@
       "hidden": true,
       "cacheVariables": {
         "ENABLE_FRONTEND_API": true,
-        "ENABLE_QT": true
+        "ENABLE_QT": true,
+        "BUILD_TESTING": false
       }
     },
     {
@@ -42,7 +43,8 @@
       "generator": "Xcode",
       "cacheVariables": {
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_CCACHE": true
+        "ENABLE_CCACHE": true,
+        "BUILD_TESTING": true
       }
     },
     {
@@ -57,7 +59,7 @@
         "rhs": "Windows"
       },
       "generator": "Visual Studio 17 2022",
-      "architecture": "x64,version=10.0.22621",
+      "architecture": "x64",
       "warnings": {"dev": true, "deprecated": true}
     },
     {
@@ -66,7 +68,8 @@
       "displayName": "Windows x64 CI build",
       "description": "Build for Windows x64 on CI",
       "cacheVariables": {
-        "CMAKE_COMPILE_WARNING_AS_ERROR": true
+        "CMAKE_COMPILE_WARNING_AS_ERROR": true,
+        "BUILD_TESTING": true
       }
     },
     {
@@ -95,7 +98,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_CCACHE": true
+        "ENABLE_CCACHE": true,
+        "BUILD_TESTING": true
       }
     }
   ],
@@ -141,6 +145,29 @@
       "displayName": "Ubuntu x86_64 CI",
       "description": "Ubuntu CI build for x86_64",
       "configuration": "RelWithDebInfo"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "macos-ci",
+      "configurePreset": "macos-ci",
+      "configuration": "RelWithDebInfo",
+      "output": {"outputOnFailure": true},
+      "execution": {"noTestsAction": "error", "stopOnFailure": true}
+    },
+    {
+      "name": "windows-ci-x64",
+      "configurePreset": "windows-ci-x64",
+      "configuration": "RelWithDebInfo",
+      "output": {"outputOnFailure": true},
+      "execution": {"noTestsAction": "error", "stopOnFailure": true}
+    },
+    {
+      "name": "ubuntu-ci-x86_64",
+      "configurePreset": "ubuntu-ci-x86_64",
+      "configuration": "RelWithDebInfo",
+      "output": {"outputOnFailure": true},
+      "execution": {"noTestsAction": "error", "stopOnFailure": true}
     }
   ]
 }

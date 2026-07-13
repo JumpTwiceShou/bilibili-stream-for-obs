@@ -1,288 +1,501 @@
-#include <obs-data.h>
 #include <obs-frontend-api.h>
 #include <obs-module.h>
+
+#include <QCoreApplication>
 #include <QDesktopServices>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QStringList>
-#include <QTimer>
 #include <QUrl>
-#include <vector>
+#include <atomic>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+
 #include "bilibili_api.hpp"
+#include "core/api_utils.hpp"
 #include "core/config_manager.hpp"
-#include "core/qr_generator.hpp"
+#include "http_client.hpp"
 #include "plugin_utils.hpp"
 #include "ui/dialog_factory.hpp"
+#include "ui/locale.hpp"
 #include "ui/menu_manager.hpp"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+namespace {
+using LifetimeToken = std::shared_ptr<std::atomic_bool>;
+
+void postToUi(const LifetimeToken &alive, std::function<void()> callback)
+{
+	QCoreApplication *application = QCoreApplication::instance();
+	if (!application)
+		return;
+	QMetaObject::invokeMethod(
+		application,
+		[alive, callback = std::move(callback)]() {
+			if (alive->load(std::memory_order_acquire))
+				callback();
+		},
+		Qt::QueuedConnection);
+}
+
+void appendMessage(std::string &target, const std::string &message)
+{
+	if (message.empty())
+		return;
+	if (!target.empty())
+		target += "\n";
+	target += message;
+}
+
+struct AccountResult {
+	Bili::Config config;
+	bool requestSucceeded = false;
+	bool loggedIn = false;
+	bool liveStatusKnown = false;
+	bool isLive = false;
+	std::string message;
+};
+
+AccountResult queryAccountState(Bili::Config config)
+{
+	AccountResult result;
+	result.config = std::move(config);
+	bool loggedIn = false;
+	std::string message;
+	if (!Bili::BiliApi::checkLoginStatus(result.config.cookies, loggedIn, message, result.config.mid)) {
+		result.message = message;
+		return result;
+	}
+
+	result.requestSucceeded = true;
+	result.loggedIn = loggedIn;
+	result.config.login_status = loggedIn;
+	if (!loggedIn) {
+		result.config.cookies.clear();
+		result.config.csrf_token.clear();
+		result.config.mid.clear();
+		result.config.managed_session = false;
+		result.message = "Bilibili 登录已失效，请重新扫码登录";
+		return result;
+	}
+
+	std::string roomId;
+	std::string csrfToken;
+	if (Bili::BiliApi::getRoomIdAndCsrf(result.config.cookies, roomId, csrfToken, message)) {
+		result.config.room_id = roomId;
+		result.config.csrf_token = csrfToken;
+	} else {
+		appendMessage(result.message, message);
+	}
+
+	bool isLive = false;
+	if (Bili::BiliApi::getLiveStatus(result.config, isLive, message)) {
+		result.liveStatusKnown = true;
+		result.isLive = isLive;
+		if (!isLive)
+			result.config.managed_session = false;
+	} else {
+		appendMessage(result.message, message);
+	}
+	return result;
+}
+
+struct StartAttempt {
+	Bili::Config config;
+	bool started = false;
+	std::string rtmpAddress;
+	std::string rtmpCode;
+	std::string faceUrl;
+	int faceAuthCode = 0;
+	std::string message;
+};
+
+StartAttempt startLive(Bili::Config config)
+{
+	StartAttempt result;
+	result.config = std::move(config);
+	std::string mid = result.config.mid;
+	result.started = Bili::BiliApi::startLive(result.config, result.rtmpAddress, result.rtmpCode, result.message,
+						  result.faceUrl, result.faceAuthCode, mid);
+	result.config.mid = mid;
+	return result;
+}
+
+struct ToggleResult {
+	bool liveStatusKnown = false;
+	bool wasLive = false;
+	bool stopped = false;
+	StartAttempt start;
+	std::string message;
+};
+
+ToggleResult toggleLive(Bili::Config config)
+{
+	ToggleResult result;
+	if (!Bili::BiliApi::getLiveStatus(config, result.wasLive, result.message))
+		return result;
+	result.liveStatusKnown = true;
+	if (result.wasLive) {
+		result.stopped = Bili::BiliApi::stopLive(config, result.message);
+		return result;
+	}
+
+	Bili::RoomInfo roomInfo;
+	if (!Bili::BiliApi::getCurrentRoomInfo(config, roomInfo, result.message)) {
+		result.start.config = config;
+		result.start.message = result.message;
+		return result;
+	}
+	if (roomInfo.area_id <= 0) {
+		result.message = "未能读取当前直播间分区，无法开播，请先更新直播间信息";
+		result.start.config = config;
+		result.start.message = result.message;
+		return result;
+	}
+	config.area_id = roomInfo.area_id;
+	config.part_id = roomInfo.part_id;
+	result.start = startLive(std::move(config));
+	return result;
+}
+
+struct RoomLoadResult {
+	Bili::RoomInfo roomInfo;
+	bool hasRoomInfo = false;
+	json11::Json partitions;
+	std::string message;
+};
+
+RoomLoadResult loadRoomSettings(const Bili::Config &config)
+{
+	RoomLoadResult result;
+	std::string message;
+	result.hasRoomInfo = Bili::BiliApi::getCurrentRoomInfo(config, result.roomInfo, message);
+	if (!result.hasRoomInfo)
+		appendMessage(result.message, message);
+	result.partitions = Bili::BiliApi::getPartitionList(message);
+	if (!result.partitions.is_array())
+		appendMessage(result.message, message);
+	return result;
+}
+
+struct RoomUpdateResult {
+	Bili::Config config;
+	bool changed = false;
+	bool titleUpdated = false;
+	bool areaUpdated = false;
+	std::string message;
+};
+
+RoomUpdateResult updateRoom(Bili::Config config, const std::string &baseTitle, int baseAreaId, int basePartId,
+			    const std::string &title, int areaId, int partId)
+{
+	RoomUpdateResult result;
+	result.config = std::move(config);
+	std::string message;
+	if (!title.empty() && title != baseTitle) {
+		result.changed = true;
+		if (Bili::BiliApi::updateRoomInfo(result.config, title, message)) {
+			result.config.title = title;
+			result.titleUpdated = true;
+		} else {
+			appendMessage(result.message, message);
+		}
+	}
+	if (areaId > 0 && (areaId != baseAreaId || partId != basePartId)) {
+		result.changed = true;
+		if (Bili::BiliApi::updateRoomArea(result.config, areaId, message)) {
+			result.config.area_id = areaId;
+			result.config.part_id = partId;
+			result.areaUpdated = true;
+		} else {
+			appendMessage(result.message, message);
+		}
+	}
+	return result;
+}
+
+struct StopSyncResult {
+	bool liveStatusKnown = false;
+	bool isLive = false;
+	bool shouldStop = false;
+	bool stopped = false;
+	std::string message;
+};
+
+StopSyncResult synchronizeManagedStop(const Bili::Config &config)
+{
+	StopSyncResult result;
+	result.liveStatusKnown = Bili::BiliApi::getLiveStatus(config, result.isLive, result.message);
+	result.shouldStop =
+		Core::shouldStopManagedSession(config.managed_session, result.liveStatusKnown, result.isLive);
+	if (!result.shouldStop)
+		return result;
+	if (config.room_id.empty() || config.csrf_token.empty() || config.cookies.empty()) {
+		result.message = "托管直播配置不完整，无法同步停止 Bilibili 直播";
+		return result;
+	}
+	result.stopped = Bili::BiliApi::stopLive(config, result.message);
+	return result;
+}
+} // namespace
+
 class BilibiliStreamPlugin : public QObject {
 	Q_OBJECT
 public:
 	explicit BilibiliStreamPlugin(QMainWindow *parent);
-	~BilibiliStreamPlugin();
+	~BilibiliStreamPlugin() override;
 
 private slots:
 	void onScanQrcode();
+	void onLogout();
 	void onStreamToggle();
 	void onOpenRoom();
 	void onUpdateRoomInfo();
 
 private:
-	static void frontendEventCallback(enum obs_frontend_event event, void *private_data);
+	static void frontendEventCallback(enum obs_frontend_event event, void *privateData);
 
+	bool enqueue(std::function<void()> task);
 	void handleFrontendEvent(enum obs_frontend_event event);
+	void refreshAccountState(bool notifyFailure = false);
+	void finishAccountRefresh(const AccountResult &result, bool notifyFailure);
+	void validateNewLogin(const std::string &cookies);
 	void updateLoginStatus();
+	void setControlsBusy(bool busy);
+	void setLiveState(bool isLive);
+	void saveConfig(bool notifyFailure = false);
 	void openLiveRoom();
-	void setStreamingState(bool streaming);
-	bool queryLiveStatus(bool &is_live, std::string &message);
-	bool queryCurrentRoomInfo(Bili::RoomInfo &roomInfo, std::string &message);
-	bool prepareStartConfig(Bili::Config &startConfig, std::string &message);
-	bool tryStartLive(const Bili::Config &startConfig, std::string &message, std::string &faceQr);
-	void handleStartLiveSuccess(const std::string &rtmpAddr, const std::string &rtmpCode);
-	void handleFaceAuthRequired(const Bili::Config &startConfig, const std::string &faceUrl);
+	void handleStartAttempt(StartAttempt result);
+	void retryStartAfterFace(Bili::Config config);
+	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode);
+	void applyRoomChanges(const std::string &baseTitle, int baseAreaId, int basePartId, const std::string &title,
+			      int areaId, int partId);
 
 	Core::ConfigManager m_config;
-	UI::MenuManager *m_menu;
+	UI::MenuManager *m_menu = nullptr;
+	LifetimeToken m_alive = std::make_shared<std::atomic_bool>(true);
 	bool m_frontendCallbackRegistered = false;
+	bool m_operationInFlight = false;
+	bool m_stopSyncInFlight = false;
 };
 
 BilibiliStreamPlugin::BilibiliStreamPlugin(QMainWindow *parent)
-	: QObject(nullptr), m_menu(new UI::MenuManager(parent->menuBar(), this))
+	: QObject(nullptr),
+	  m_menu(new UI::MenuManager(parent->menuBar(), this))
 {
 	m_config.load();
-
 	connect(m_menu, &UI::MenuManager::scanQrcodeClicked, this, &BilibiliStreamPlugin::onScanQrcode);
+	connect(m_menu, &UI::MenuManager::logoutClicked, this, &BilibiliStreamPlugin::onLogout);
 	connect(m_menu, &UI::MenuManager::streamToggleClicked, this, &BilibiliStreamPlugin::onStreamToggle);
 	connect(m_menu, &UI::MenuManager::openRoomClicked, this, &BilibiliStreamPlugin::onOpenRoom);
 	connect(m_menu, &UI::MenuManager::updateRoomInfoClicked, this, &BilibiliStreamPlugin::onUpdateRoomInfo);
-
-	auto &cfg = m_config.config();
-	if (!cfg.cookies.empty()) {
-		std::string message;
-		if (Bili::BiliApi::checkLoginStatus(cfg.cookies, message, cfg.mid)) {
-			cfg.login_status = true;
-			std::string newRoomId, newCsrfToken;
-			if (Bili::BiliApi::getRoomIdAndCsrf(cfg.cookies, newRoomId, newCsrfToken, message)) {
-				cfg.room_id = newRoomId;
-				cfg.csrf_token = newCsrfToken;
-				m_config.save();
-			}
-		}
-	}
-
 	updateLoginStatus();
-
-	bool isLive = false;
-	std::string message;
-	if (queryLiveStatus(isLive, message)) {
-		setStreamingState(isLive);
-	} else {
-		setStreamingState(cfg.streaming);
-		if (!message.empty()) {
-			obs_log(LOG_WARNING, "Failed to query Bilibili live status on startup: %s", message.c_str());
-		}
-	}
-
+	setLiveState(false);
 	obs_frontend_add_event_callback(&BilibiliStreamPlugin::frontendEventCallback, this);
 	m_frontendCallbackRegistered = true;
+	refreshAccountState(false);
 }
 
 BilibiliStreamPlugin::~BilibiliStreamPlugin()
 {
+	m_alive->store(false, std::memory_order_release);
 	if (m_frontendCallbackRegistered) {
 		obs_frontend_remove_event_callback(&BilibiliStreamPlugin::frontendEventCallback, this);
 		m_frontendCallbackRegistered = false;
 	}
-
+	delete m_menu;
+	m_menu = nullptr;
 	obs_log(LOG_DEBUG, "Released BilibiliStreamPlugin resources");
 }
 
-void BilibiliStreamPlugin::frontendEventCallback(enum obs_frontend_event event, void *private_data)
+bool BilibiliStreamPlugin::enqueue(std::function<void()> task)
 {
-	auto *plugin = static_cast<BilibiliStreamPlugin *>(private_data);
-	if (plugin) {
-		plugin->handleFrontendEvent(event);
-	}
+	if (Http::HttpClient::enqueue(std::move(task)))
+		return true;
+	obs_log(LOG_ERROR, "Background request queue is unavailable");
+	return false;
+}
+
+void BilibiliStreamPlugin::frontendEventCallback(enum obs_frontend_event event, void *privateData)
+{
+	auto *plugin = static_cast<BilibiliStreamPlugin *>(privateData);
+	if (!plugin)
+		return;
+	QMetaObject::invokeMethod(
+		plugin, [plugin, event]() { plugin->handleFrontendEvent(event); }, Qt::QueuedConnection);
 }
 
 void BilibiliStreamPlugin::handleFrontendEvent(enum obs_frontend_event event)
 {
-	if (event != OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
+	if (event != OBS_FRONTEND_EVENT_STREAMING_STOPPED || m_stopSyncInFlight)
+		return;
+	const Bili::Config config = m_config.config();
+	if (!config.managed_session) {
+		obs_log(LOG_DEBUG, "Ignoring OBS stop event because no plugin-managed Bilibili session is active");
 		return;
 	}
 
-	auto &cfg = m_config.config();
-	bool shouldStopLive = cfg.streaming;
-	bool isLive = false;
-	std::string statusMessage;
-
-	if (queryLiveStatus(isLive, statusMessage)) {
-		shouldStopLive = isLive;
-		setStreamingState(isLive);
-	} else if (!statusMessage.empty()) {
-		obs_log(LOG_WARNING, "Failed to query Bilibili live status after OBS stop event: %s",
-			statusMessage.c_str());
+	m_stopSyncInFlight = true;
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config]() {
+		    const StopSyncResult result = synchronizeManagedStop(config);
+		    postToUi(alive, [this, result]() {
+			    m_stopSyncInFlight = false;
+			    if (result.liveStatusKnown)
+				    setLiveState(result.isLive);
+			    if (!result.shouldStop || result.stopped) {
+				    m_config.config().managed_session = false;
+				    setLiveState(false);
+				    saveConfig(false);
+				    obs_log(LOG_INFO,
+					    "Synchronized plugin-managed Bilibili stop after OBS stopped streaming");
+			    } else {
+				    obs_log(LOG_ERROR,
+					    "Failed to synchronize Bilibili stop after OBS stopped streaming: %s",
+					    result.message.c_str());
+			    }
+		    });
+	    })) {
+		m_stopSyncInFlight = false;
 	}
+}
 
-	if (!shouldStopLive) {
-		obs_log(LOG_INFO, "OBS streaming stopped; Bilibili live is already inactive");
+void BilibiliStreamPlugin::refreshAccountState(bool notifyFailure)
+{
+	const Bili::Config config = m_config.config();
+	if (config.cookies.empty()) {
+		updateLoginStatus();
+		setControlsBusy(false);
+		return;
+	}
+	setControlsBusy(true);
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config, notifyFailure]() {
+		    const AccountResult result = queryAccountState(config);
+		    postToUi(alive, [this, result, notifyFailure]() { finishAccountRefresh(result, notifyFailure); });
+	    })) {
+		setControlsBusy(false);
+	}
+}
+
+void BilibiliStreamPlugin::finishAccountRefresh(const AccountResult &result, bool notifyFailure)
+{
+	if (!result.requestSucceeded) {
+		setControlsBusy(false);
+		obs_log(LOG_WARNING, "Failed to refresh Bilibili account state: %s", result.message.c_str());
+		if (notifyFailure)
+			UI::DialogFactory::message(QString::fromUtf8(result.message), UI::text("Dialog.LoginFailed"));
 		return;
 	}
 
-	if (cfg.room_id.empty() || cfg.csrf_token.empty() || cfg.cookies.empty()) {
-		obs_log(LOG_WARNING, "OBS streaming stopped but Bilibili stopLive was skipped because config is incomplete");
-		return;
-	}
+	m_config.config() = result.config;
+	updateLoginStatus();
+	setControlsBusy(false);
+	if (result.liveStatusKnown)
+		setLiveState(result.isLive);
+	if (!result.loggedIn)
+		setLiveState(false);
+	saveConfig(notifyFailure);
+	if (!result.loggedIn && notifyFailure)
+		UI::DialogFactory::message(QString::fromUtf8(result.message), UI::text("Dialog.LoginFailed"));
+	if (result.loggedIn && !result.message.empty())
+		obs_log(LOG_WARNING, "Bilibili account refresh completed with warnings: %s", result.message.c_str());
+}
 
-	std::string stopMessage;
-	if (Bili::BiliApi::stopLive(cfg, stopMessage)) {
-		obs_log(LOG_INFO, "OBS streaming stopped; synchronized Bilibili stopLive successfully");
-		setStreamingState(false);
-		m_config.save();
-	} else {
-		obs_log(LOG_ERROR, "OBS streaming stopped; failed to synchronize Bilibili stopLive: %s",
-			stopMessage.c_str());
+void BilibiliStreamPlugin::validateNewLogin(const std::string &cookies)
+{
+	Bili::Config config = m_config.config();
+	config.cookies = cookies;
+	config.csrf_token = Core::extractCookieValue(cookies, "bili_jct");
+	config.mid.clear();
+	config.managed_session = false;
+	setControlsBusy(true);
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config]() {
+		    const AccountResult result = queryAccountState(config);
+		    postToUi(alive, [this, result]() { finishAccountRefresh(result, true); });
+	    })) {
+		setControlsBusy(false);
 	}
 }
 
 void BilibiliStreamPlugin::updateLoginStatus()
 {
-	auto &cfg = m_config.config();
-	m_menu->actions().loginStatus->setText(cfg.login_status ? QStringLiteral("登录状态: 已登录")
-							 : QStringLiteral("登录状态: 未登录"));
-	m_menu->actions().loginStatus->setChecked(cfg.login_status);
+	const auto &config = m_config.config();
+	m_menu->actions().loginStatus->setText(config.login_status ? UI::text("Menu.LoginStatus.LoggedIn")
+								   : UI::text("Menu.LoginStatus.LoggedOut"));
+	m_menu->actions().loginStatus->setChecked(config.login_status);
+}
+
+void BilibiliStreamPlugin::setControlsBusy(bool busy)
+{
+	m_operationInFlight = busy;
+	const auto &config = m_config.config();
+	const Core::ControlState state =
+		Core::controlState(busy, config.login_status, !config.room_id.empty(), !config.cookies.empty());
+	m_menu->actions().scanQrcode->setEnabled(state.scanQrEnabled);
+	m_menu->actions().logout->setEnabled(state.logoutEnabled);
+	m_menu->actions().streamToggle->setEnabled(state.streamToggleEnabled);
+	m_menu->actions().updateRoomInfo->setEnabled(state.updateRoomEnabled);
+	m_menu->actions().openRoom->setEnabled(state.openRoomEnabled);
+}
+
+void BilibiliStreamPlugin::onLogout()
+{
+	if (m_operationInFlight)
+		return;
+	const Bili::Config previousConfig = m_config.config();
+	if (previousConfig.cookies.empty())
+		return;
+	if (previousConfig.managed_session) {
+		UI::DialogFactory::message(UI::text("Logout.ManagedBlocked"), UI::text("Dialog.LogoutFailed"));
+		return;
+	}
+	if (!UI::DialogFactory::confirm(UI::text("Logout.Confirm"), UI::text("Dialog.Logout")))
+		return;
+
+	m_config.config() = Bili::Config();
+	if (!m_config.save()) {
+		m_config.config() = previousConfig;
+		updateLoginStatus();
+		setControlsBusy(false);
+		UI::DialogFactory::message(UI::text("Logout.SaveFailed"), UI::text("Dialog.LogoutFailed"));
+		return;
+	}
+	updateLoginStatus();
+	setLiveState(false);
+	setControlsBusy(false);
+	UI::DialogFactory::message(UI::text("Logout.Success"), UI::text("Dialog.Logout"));
+}
+
+void BilibiliStreamPlugin::setLiveState(bool isLive)
+{
+	m_menu->actions().streamToggle->setText(isLive ? UI::text("Menu.StopLive") : UI::text("Menu.StartLive"));
+}
+
+void BilibiliStreamPlugin::saveConfig(bool notifyFailure)
+{
+	if (!m_config.save() && notifyFailure) {
+		UI::DialogFactory::message(UI::text("Config.SaveFailed"), UI::text("Dialog.ConfigError"));
+	}
 }
 
 void BilibiliStreamPlugin::openLiveRoom()
 {
-	auto &cfg = m_config.config();
-	if (cfg.room_id.empty()) {
-		UI::DialogFactory::message(QStringLiteral("room_id 为空，请先登录或更新直播间信息"), QStringLiteral("消息"));
+	const auto &config = m_config.config();
+	if (config.room_id.empty()) {
+		UI::DialogFactory::message(UI::text("Room.IdMissing"), UI::text("Common.Message"));
 		return;
 	}
-	const QString url = QString("https://live.bilibili.com/%1").arg(QString::fromStdString(cfg.room_id));
+	const QString url = QStringLiteral("https://live.bilibili.com/%1").arg(QString::fromStdString(config.room_id));
 	if (!QDesktopServices::openUrl(QUrl(url))) {
-		UI::DialogFactory::message(QStringLiteral("无法打开浏览器，请手动访问：\n") + url, QStringLiteral("消息"));
+		UI::DialogFactory::message(UI::text("Room.OpenFailed") + url, UI::text("Common.Message"));
 	}
-}
-
-void BilibiliStreamPlugin::setStreamingState(bool streaming)
-{
-	auto &cfg = m_config.config();
-	cfg.streaming = streaming;
-	m_menu->actions().streamToggle->setText(streaming ? QStringLiteral("停止直播") : QStringLiteral("开始直播"));
-}
-
-bool BilibiliStreamPlugin::queryLiveStatus(bool &is_live, std::string &message)
-{
-	auto &cfg = m_config.config();
-	if (cfg.cookies.empty()) {
-		message = "Bilibili cookies are empty";
-		return false;
-	}
-
-	return Bili::BiliApi::getLiveStatus(cfg, is_live, message);
-}
-
-bool BilibiliStreamPlugin::queryCurrentRoomInfo(Bili::RoomInfo &roomInfo, std::string &message)
-{
-	auto &cfg = m_config.config();
-	if (cfg.cookies.empty()) {
-		message = "Bilibili cookies are empty";
-		return false;
-	}
-	if (cfg.room_id.empty()) {
-		message = "room_id is empty";
-		return false;
-	}
-
-	return Bili::BiliApi::getCurrentRoomInfo(cfg, roomInfo, message);
-}
-
-bool BilibiliStreamPlugin::prepareStartConfig(Bili::Config &startConfig, std::string &message)
-{
-	Bili::RoomInfo currentRoomInfo;
-	bool hasCurrentRoomInfo = queryCurrentRoomInfo(currentRoomInfo, message);
-	if (!hasCurrentRoomInfo && !message.empty()) {
-		obs_log(LOG_WARNING, "Failed to query current room info before start live: %s", message.c_str());
-	}
-
-	auto &cfg = m_config.config();
-	startConfig = cfg;
-	if (!hasCurrentRoomInfo) {
-		message = "无法读取当前直播间信息，无法直接开播，请先更新直播间信息";
-		return false;
-	}
-	if (currentRoomInfo.area_id <= 0) {
-		message = "未能读取当前直播间分区，无法直接开播，请先更新直播间信息";
-		return false;
-	}
-
-	startConfig.area_id = currentRoomInfo.area_id;
-	startConfig.part_id = currentRoomInfo.part_id;
-	return true;
-}
-
-bool BilibiliStreamPlugin::tryStartLive(const Bili::Config &startConfig, std::string &message, std::string &faceQr)
-{
-	auto retryConfig = startConfig;
-	auto &cfg = m_config.config();
-	std::string rtmpAddr, rtmpCode;
-	if (Bili::BiliApi::startLive(retryConfig, rtmpAddr, rtmpCode, message, faceQr, cfg.mid)) {
-		handleStartLiveSuccess(rtmpAddr, rtmpCode);
-		return true;
-	}
-	return false;
-}
-
-void BilibiliStreamPlugin::handleStartLiveSuccess(const std::string &rtmpAddr, const std::string &rtmpCode)
-{
-	auto &cfg = m_config.config();
-	setStreamingState(true);
-	cfg.rtmp_addr = rtmpAddr;
-	cfg.rtmp_code = rtmpCode;
-	m_config.save();
-	UI::DialogFactory::streamStarted((QWidget *)obs_frontend_get_main_window(), rtmpAddr, rtmpCode);
-}
-
-void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &startConfig, const std::string &faceUrl)
-{
-	auto parent = (QWidget *)obs_frontend_get_main_window();
-
-	UI::DialogFactory::faceAuth(
-		parent, faceUrl,
-		[this, startConfig](std::string &statusMessage) -> bool {
-			bool isIdentified = false;
-			if (!Bili::BiliApi::isUserIdentifiedByFaceAuth(startConfig, isIdentified, statusMessage)) {
-				if (statusMessage.empty()) {
-					statusMessage = "查询人脸认证状态失败，插件会继续自动轮询...";
-				}
-				return false;
-			}
-
-			if (isIdentified) {
-				statusMessage = "人脸认证已完成，准备自动开播...";
-				return true;
-			}
-
-			statusMessage = "仍在等待人脸认证完成...";
-			return false;
-		},
-		[this, startConfig]() {
-			QTimer::singleShot(0, this, [this, startConfig]() {
-				std::string statusMessage;
-				std::string faceQr;
-				if (!tryStartLive(startConfig, statusMessage, faceQr)) {
-					if (!faceQr.empty()) {
-						handleFaceAuthRequired(startConfig, faceQr);
-					} else {
-						UI::DialogFactory::message(QString::fromUtf8(statusMessage.c_str()), QStringLiteral("开播失败"));
-					}
-				}
-			});
-		});
 }
 
 void BilibiliStreamPlugin::onOpenRoom()
@@ -292,140 +505,239 @@ void BilibiliStreamPlugin::onOpenRoom()
 
 void BilibiliStreamPlugin::onScanQrcode()
 {
-	auto &cfg = m_config.config();
-	std::string qrData, qrKey, message;
-	if (!Bili::BiliApi::getQrCode(cfg.cookies, qrData, qrKey, message)) {
-		obs_log(LOG_ERROR, "Failed to get QR code");
-		UI::DialogFactory::message(QString::fromUtf8(message), QStringLiteral("消息"));
+	if (m_operationInFlight)
 		return;
+	setControlsBusy(true);
+	const std::string cookies = m_config.config().cookies;
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, cookies]() {
+		    std::string qrData;
+		    std::string qrKey;
+		    std::string message;
+		    const bool succeeded = Bili::BiliApi::getQrCode(cookies, qrData, qrKey, message);
+		    postToUi(alive, [this, succeeded, qrData, qrKey, message]() {
+			    setControlsBusy(false);
+			    if (!succeeded) {
+				    UI::DialogFactory::message(QString::fromUtf8(message),
+							       UI::text("Dialog.LoginFailed"));
+				    return;
+			    }
+			    auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
+			    UI::DialogFactory::qrLogin(
+				    parent, qrData,
+				    [this, qrKey](UI::DialogFactory::QrPollCallback callback) {
+					    const auto pollAlive = m_alive;
+					    auto failureCallback = callback;
+					    if (!enqueue([pollAlive, qrKey, callback = std::move(callback)]() mutable {
+							std::string loginCookies;
+							std::string statusMessage;
+							const auto result = Bili::BiliApi::qrLogin(qrKey, loginCookies,
+												   statusMessage);
+							postToUi(pollAlive,
+								 [callback = std::move(callback), result,
+								  loginCookies = std::move(loginCookies),
+								  statusMessage = std::move(statusMessage)]() mutable {
+									 callback(result, std::move(loginCookies),
+										  std::move(statusMessage));
+								 });
+						})) {
+						    failureCallback(Bili::BiliApi::QrLoginResult::Error, {},
+								    "后台请求队列不可用");
+					    }
+				    },
+				    [this](const std::string &loginCookies) { validateNewLogin(loginCookies); });
+		    });
+	    })) {
+		setControlsBusy(false);
 	}
-
-	auto parent = (QWidget *)obs_frontend_get_main_window();
-	UI::DialogFactory::qrLogin(parent, qrData, qrKey, [this, &cfg](const std::string &cookies) {
-		std::string msg;
-		cfg.cookies = cookies;
-		cfg.login_status = Bili::BiliApi::checkLoginStatus(cfg.cookies, msg, cfg.mid);
-		updateLoginStatus();
-
-		std::string newRoomId, newCsrfToken;
-		if (Bili::BiliApi::getRoomIdAndCsrf(cfg.cookies, newRoomId, newCsrfToken, msg)) {
-			cfg.room_id = newRoomId;
-			cfg.csrf_token = newCsrfToken;
-		}
-
-		bool isLive = false;
-		if (queryLiveStatus(isLive, msg)) {
-			setStreamingState(isLive);
-		}
-
-		m_config.save();
-	});
 }
 
 void BilibiliStreamPlugin::onStreamToggle()
 {
-	auto &cfg = m_config.config();
-	std::string message;
+	if (m_operationInFlight || !m_config.config().login_status)
+		return;
+	setControlsBusy(true);
+	const Bili::Config config = m_config.config();
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config]() {
+		    ToggleResult result = toggleLive(config);
+		    postToUi(alive, [this, result = std::move(result)]() mutable {
+			    if (!result.liveStatusKnown) {
+				    setControlsBusy(false);
+				    UI::DialogFactory::message(QString::fromUtf8(result.message),
+							       UI::text("Dialog.OperationFailed"));
+				    return;
+			    }
+			    setLiveState(result.wasLive);
+			    if (result.wasLive) {
+				    setControlsBusy(false);
+				    if (result.stopped) {
+					    m_config.config().managed_session = false;
+					    setLiveState(false);
+					    saveConfig(true);
+					    UI::DialogFactory::message(UI::text("Room.LiveStopped"),
+								       UI::text("Common.Message"));
+				    } else {
+					    UI::DialogFactory::message(QString::fromUtf8(result.message),
+								       UI::text("Dialog.StopFailed"));
+				    }
+				    return;
+			    }
+			    handleStartAttempt(std::move(result.start));
+		    });
+	    })) {
+		setControlsBusy(false);
+	}
+}
 
-	if (cfg.streaming) {
-		if (Bili::BiliApi::stopLive(cfg, message)) {
-			setStreamingState(false);
-			m_config.save();
-			UI::DialogFactory::message(QStringLiteral("直播已停止"), QStringLiteral("消息"));
-		} else {
-			UI::DialogFactory::message(QString::fromUtf8(message), QStringLiteral("消息"));
-		}
+void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
+{
+	setControlsBusy(false);
+	if (result.started) {
+		m_config.config() = result.config;
+		m_config.config().managed_session = true;
+		setLiveState(true);
+		saveConfig(true);
+		UI::DialogFactory::streamStarted(static_cast<QWidget *>(obs_frontend_get_main_window()),
+						 result.rtmpAddress, result.rtmpCode);
 		return;
 	}
-
-	Bili::Config startConfig = cfg;
-	if (!prepareStartConfig(startConfig, message)) {
-		UI::DialogFactory::message(QString::fromUtf8(message.c_str()), QStringLiteral("消息"));
+	if (!result.faceUrl.empty() && result.faceAuthCode != 0) {
+		handleFaceAuthRequired(result.config, result.faceUrl, result.faceAuthCode);
 		return;
 	}
+	UI::DialogFactory::message(QString::fromUtf8(result.message), UI::text("Dialog.StartFailed"));
+}
 
-	std::string rtmpAddr, rtmpCode, faceQr;
-	if (tryStartLive(startConfig, message, faceQr)) {
-		return;
-	} else {
-		if (!faceQr.empty()) {
-			handleFaceAuthRequired(startConfig, faceQr);
-		} else {
-			UI::DialogFactory::message(QString::fromUtf8(message.c_str()), QStringLiteral("开播失败"));
-		}
+void BilibiliStreamPlugin::retryStartAfterFace(Bili::Config config)
+{
+	setControlsBusy(true);
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config = std::move(config)]() mutable {
+		    StartAttempt result = startLive(std::move(config));
+		    postToUi(alive,
+			     [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
+	    })) {
+		setControlsBusy(false);
 	}
+}
+
+void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl,
+						  int faceAuthCode)
+{
+	auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
+	UI::DialogFactory::faceAuth(
+		parent, faceUrl,
+		[this, config, faceAuthCode](UI::DialogFactory::FacePollCallback callback) {
+			const auto alive = m_alive;
+			auto failureCallback = callback;
+			if (!enqueue([alive, config, faceAuthCode, callback = std::move(callback)]() mutable {
+				    bool identified = false;
+				    std::string statusMessage;
+				    const bool requestSucceeded = Bili::BiliApi::isUserIdentifiedByFaceAuth(
+					    config, faceAuthCode, identified, statusMessage);
+				    postToUi(alive, [callback = std::move(callback), requestSucceeded, identified,
+						     statusMessage = std::move(statusMessage)]() mutable {
+					    callback(requestSucceeded, identified, std::move(statusMessage));
+				    });
+			    })) {
+				failureCallback(false, false, "后台请求队列不可用");
+			}
+		},
+		[this, config]() { retryStartAfterFace(config); });
 }
 
 void BilibiliStreamPlugin::onUpdateRoomInfo()
 {
-	auto &cfg = m_config.config();
-	auto parent = (QWidget *)obs_frontend_get_main_window();
-
-	Bili::RoomInfo currentRoomInfo;
-	std::string roomInfoMessage;
-	const bool hasCurrentRoomInfo = queryCurrentRoomInfo(currentRoomInfo, roomInfoMessage);
-	if (!hasCurrentRoomInfo && !roomInfoMessage.empty()) {
-		obs_log(LOG_WARNING, "Failed to query current room info before editing: %s", roomInfoMessage.c_str());
+	if (m_operationInFlight || !m_config.config().login_status)
+		return;
+	const Bili::Config config = m_config.config();
+	if (config.room_id.empty()) {
+		UI::DialogFactory::message(UI::text("Room.IdMissingLogin"), UI::text("Common.Message"));
+		return;
 	}
+	setControlsBusy(true);
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config]() {
+		    RoomLoadResult result = loadRoomSettings(config);
+		    postToUi(alive, [this, config, result = std::move(result)]() mutable {
+			    setControlsBusy(false);
+			    if (!result.message.empty())
+				    obs_log(LOG_WARNING, "Room settings loaded with warnings: %s",
+					    result.message.c_str());
+			    const std::string title = result.hasRoomInfo ? result.roomInfo.title : config.title;
+			    const int areaId = result.hasRoomInfo ? result.roomInfo.area_id : config.area_id;
+			    const int partId = result.hasRoomInfo ? result.roomInfo.part_id : config.part_id;
+			    UI::DialogFactory::roomSettings(
+				    static_cast<QWidget *>(obs_frontend_get_main_window()), config.room_id, title,
+				    areaId, partId, result.partitions,
+				    [this, title, areaId, partId](const std::string &newTitle, int newAreaId,
+								  int newPartId) {
+					    applyRoomChanges(title, areaId, partId, newTitle, newAreaId, newPartId);
+				    });
+		    });
+	    })) {
+		setControlsBusy(false);
+	}
+}
 
-	const std::string dialogTitle = hasCurrentRoomInfo ? currentRoomInfo.title : cfg.title;
-	const int dialogAreaId = hasCurrentRoomInfo ? currentRoomInfo.area_id : cfg.area_id;
-	const int dialogPartId = hasCurrentRoomInfo ? currentRoomInfo.part_id : cfg.part_id;
-
-	UI::DialogFactory::roomSettings(parent, cfg.room_id, dialogTitle, dialogAreaId, dialogPartId,
-					[this, &cfg, currentRoomInfo, hasCurrentRoomInfo](
-						const std::string &title, int areaId, int partId) {
-						const std::string baseTitle = hasCurrentRoomInfo ? currentRoomInfo.title : cfg.title;
-						const int baseAreaId = hasCurrentRoomInfo ? currentRoomInfo.area_id : cfg.area_id;
-						const int basePartId = hasCurrentRoomInfo ? currentRoomInfo.part_id : cfg.part_id;
-
-						QStringList successMessages;
-						std::string message;
-
-						if (!title.empty() && title != baseTitle) {
-							if (!Bili::BiliApi::updateRoomInfo(cfg, title, message)) {
-								UI::DialogFactory::message(QString::fromUtf8(message), QStringLiteral("消息"));
-								return;
-							}
-							cfg.title = title;
-							successMessages.append(QStringLiteral("直播间标题已更新"));
-						} else if (!title.empty()) {
-							cfg.title = title;
-						}
-
-						if (areaId > 0 && (areaId != baseAreaId || partId != basePartId)) {
-							if (!Bili::BiliApi::updateRoomArea(cfg, areaId, message)) {
-								UI::DialogFactory::message(QString::fromUtf8(message), QStringLiteral("消息"));
-								return;
-							}
-							cfg.area_id = areaId;
-							cfg.part_id = partId;
-							successMessages.append(QStringLiteral("直播间分区已更新"));
-						} else if (areaId > 0) {
-							cfg.area_id = areaId;
-							cfg.part_id = partId;
-						}
-
-						m_config.save();
-
-						if (successMessages.empty()) {
-							UI::DialogFactory::message(QStringLiteral("直播间信息没有变化"), QStringLiteral("消息"));
-							return;
-						}
-
-						UI::DialogFactory::message(successMessages.join(QStringLiteral("\n")), QStringLiteral("消息"));
-					});
+void BilibiliStreamPlugin::applyRoomChanges(const std::string &baseTitle, int baseAreaId, int basePartId,
+					    const std::string &title, int areaId, int partId)
+{
+	setControlsBusy(true);
+	const Bili::Config config = m_config.config();
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config, baseTitle, baseAreaId, basePartId, title, areaId, partId]() {
+		    RoomUpdateResult result =
+			    updateRoom(config, baseTitle, baseAreaId, basePartId, title, areaId, partId);
+		    postToUi(alive, [this, result = std::move(result)]() mutable {
+			    setControlsBusy(false);
+			    if (!result.changed) {
+				    UI::DialogFactory::message(UI::text("Room.NoChanges"), UI::text("Common.Message"));
+				    return;
+			    }
+			    QStringList messages;
+			    if (result.titleUpdated)
+				    messages.append(UI::text("Room.TitleUpdated"));
+			    if (result.areaUpdated)
+				    messages.append(UI::text("Room.AreaUpdated"));
+			    if (result.titleUpdated || result.areaUpdated) {
+				    m_config.config() = result.config;
+				    saveConfig(true);
+			    }
+			    if (!result.message.empty())
+				    messages.append(QString::fromUtf8(result.message));
+			    UI::DialogFactory::message(messages.join(QStringLiteral("\n")),
+						       result.message.empty() ? UI::text("Common.Message")
+									      : UI::text("Dialog.PartialFailure"));
+		    });
+	    })) {
+		setControlsBusy(false);
+	}
 }
 
 static BilibiliStreamPlugin *plugin = nullptr;
 
 bool obs_module_load(void)
 {
-	Bili::BiliApi::init();
-	auto mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
-	if (!mainWindow)
+	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!mainWindow) {
+		obs_log(LOG_ERROR, "OBS frontend main window is unavailable");
 		return false;
-	plugin = new BilibiliStreamPlugin(mainWindow);
+	}
+	if (!Bili::BiliApi::init())
+		return false;
+	try {
+		plugin = new BilibiliStreamPlugin(mainWindow);
+	} catch (const std::exception &error) {
+		obs_log(LOG_ERROR, "Plugin initialization failed: %s", error.what());
+		Bili::BiliApi::cleanup();
+		return false;
+	} catch (...) {
+		obs_log(LOG_ERROR, "Plugin initialization failed");
+		Bili::BiliApi::cleanup();
+		return false;
+	}
 	obs_log(LOG_INFO, "Plugin loaded successfully");
 	return true;
 }
