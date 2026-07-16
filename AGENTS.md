@@ -1,5 +1,7 @@
 # AGENTS.md - bilibilistream plugin1
 
+<!-- homelab-project-initialization: complete -->
+
 ## Startup
 
 Read `~/.codex/SHARED_AGENT_RULES.md`, `docs/local-integration-notes.md` before stream-control integration changes, and the active file under `task/` when the work requires one.
