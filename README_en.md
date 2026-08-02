@@ -50,7 +50,7 @@ The first public release of this repository is `1.0.0`. The basic workflow follo
 
 ## Face Verification
 
-If Bilibili requires face verification, scan the QR code shown by the plugin. After verification succeeds, the plugin detects the verification status and continues starting the live session automatically.
+If Bilibili requires face verification, scan the QR code shown by the plugin. After verification succeeds, the plugin detects the verification status and continues starting the live session automatically. The QR window closes only after start-live succeeds; if Bilibili still requires verification, the same window remains open and continues waiting.
 
 This verification-status check uses a non-public Bilibili endpoint and may stop working if the platform changes its APIs.
 

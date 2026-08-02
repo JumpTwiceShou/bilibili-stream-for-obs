@@ -33,6 +33,12 @@ int main()
 	expect(!Core::jsonInteger(json11::Json("8x"), value, 1), "rejects a malformed numeric string");
 	expect(!Core::jsonInteger(json11::Json(1.5), value, 1), "rejects a fractional JSON number");
 	expect(!Core::jsonInteger(json11::Json(), value, 1), "rejects a missing value without throwing");
+	expect(Core::classifyFaceAuthRetry(true, false) == Core::FaceAuthRetryDecision::Started,
+	       "completes face authentication only after start-live succeeds");
+	expect(Core::classifyFaceAuthRetry(false, true) == Core::FaceAuthRetryDecision::ContinueWaiting,
+	       "keeps one face-auth dialog open when start-live still requires verification");
+	expect(Core::classifyFaceAuthRetry(false, false) == Core::FaceAuthRetryDecision::Failed,
+	       "surfaces a terminal start-live failure after face authentication");
 
 	expect(!Core::shouldStopManagedSession(false, true, true), "does not stop an unmanaged live session");
 	expect(!Core::shouldStopManagedSession(true, true, false), "does not stop an already inactive managed session");

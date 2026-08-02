@@ -162,8 +162,8 @@ void DialogFactory::streamStarted(QWidget *parent, const std::string &rtmpAddr, 
 	dialog.exec();
 }
 
-void DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
-			     std::function<void()> onVerified)
+bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
+			     FaceRetryRequest requestRetry)
 {
 	QDialog dialog(parent);
 	configureDialog(dialog, text("Face.Title"));
@@ -196,7 +196,7 @@ void DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	QTimer timer(&dialog);
 	timer.setInterval(5000);
 	QPointer<QDialog> guard(&dialog);
-	const auto poll = [guard, state, &timer, statusLabel, requestPoll, onVerified]() {
+	const auto poll = [guard, state, &timer, qrLabel, statusLabel, requestPoll, requestRetry]() {
 		if (!guard || state->inFlight)
 			return;
 		if (state->elapsed.elapsed() > 600000) {
@@ -205,26 +205,47 @@ void DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 			return;
 		}
 		state->inFlight = true;
-		requestPoll([guard, state, &timer, statusLabel, onVerified](bool requestSucceeded, bool identified,
-									    std::string statusMessage) {
+		requestPoll([guard, state, &timer, qrLabel, statusLabel,
+			     requestRetry](bool requestSucceeded, bool identified, std::string statusMessage) {
 			if (!guard)
 				return;
-			state->inFlight = false;
 			if (!statusMessage.empty())
 				statusLabel->setText(QString::fromUtf8(statusMessage));
-			if (requestSucceeded && identified) {
+			if (!requestSucceeded || !identified) {
+				state->inFlight = false;
+				return;
+			}
+
+			statusLabel->setText(text("Face.Retrying"));
+			requestRetry([guard, state, &timer, qrLabel, statusLabel](Core::FaceAuthRetryDecision decision,
+										  std::string retryFaceUrl,
+										  std::string retryMessage) {
+				if (!guard)
+					return;
+				if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
+					if (!retryFaceUrl.empty()) {
+						const QPixmap retryPixmap = Core::QrGenerator::generate(retryFaceUrl);
+						if (retryPixmap.isNull())
+							qrLabel->setText(text("Face.GenerateFailed"));
+						else
+							qrLabel->setPixmap(retryPixmap);
+					}
+					statusLabel->setText(retryMessage.empty() ? text("Face.StillRequired")
+										  : QString::fromUtf8(retryMessage));
+					state->inFlight = false;
+					return;
+				}
+
 				timer.stop();
 				guard->accept();
-				if (onVerified)
-					onVerified();
-			}
+			});
 		});
 	};
 	QObject::connect(&timer, &QTimer::timeout, &dialog, poll);
 	QObject::connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::reject);
 	timer.start();
 	QTimer::singleShot(0, &dialog, poll);
-	dialog.exec();
+	return dialog.exec() == QDialog::Accepted;
 }
 
 void DialogFactory::roomSettings(QWidget *parent, const std::string &roomUrl, const std::string &currentTitle,

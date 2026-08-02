@@ -271,7 +271,6 @@ private:
 	void saveConfig(bool notifyFailure = false);
 	void openLiveRoom();
 	void handleStartAttempt(StartAttempt result);
-	void retryStartAfterFace(Bili::Config config);
 	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode);
 	void applyRoomChanges(const std::string &baseTitle, int baseAreaId, int basePartId, const std::string &title,
 			      int areaId, int partId);
@@ -609,33 +608,34 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 	UI::DialogFactory::message(QString::fromUtf8(result.message), UI::text("Dialog.StartFailed"));
 }
 
-void BilibiliStreamPlugin::retryStartAfterFace(Bili::Config config)
-{
-	setControlsBusy(true);
-	const auto alive = m_alive;
-	if (!enqueue([this, alive, config = std::move(config)]() mutable {
-		    StartAttempt result = startLive(std::move(config));
-		    postToUi(alive,
-			     [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
-	    })) {
-		setControlsBusy(false);
-	}
-}
-
 void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl,
 						  int faceAuthCode)
 {
+	struct FaceAuthSession {
+		Bili::Config config;
+		std::string faceUrl;
+		int faceAuthCode = 0;
+		StartAttempt completedAttempt;
+		bool hasCompletedAttempt = false;
+	};
+	auto session = std::make_shared<FaceAuthSession>();
+	session->config = config;
+	session->faceUrl = faceUrl;
+	session->faceAuthCode = faceAuthCode;
+
 	auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
-	UI::DialogFactory::faceAuth(
+	const bool completed = UI::DialogFactory::faceAuth(
 		parent, faceUrl,
-		[this, config, faceAuthCode](UI::DialogFactory::FacePollCallback callback) {
+		[this, session](UI::DialogFactory::FacePollCallback callback) {
 			const auto alive = m_alive;
+			const Bili::Config pollConfig = session->config;
+			const int pollAuthCode = session->faceAuthCode;
 			auto failureCallback = callback;
-			if (!enqueue([alive, config, faceAuthCode, callback = std::move(callback)]() mutable {
+			if (!enqueue([alive, pollConfig, pollAuthCode, callback = std::move(callback)]() mutable {
 				    bool identified = false;
 				    std::string statusMessage;
 				    const bool requestSucceeded = Bili::BiliApi::isUserIdentifiedByFaceAuth(
-					    config, faceAuthCode, identified, statusMessage);
+					    pollConfig, pollAuthCode, identified, statusMessage);
 				    postToUi(alive, [callback = std::move(callback), requestSucceeded, identified,
 						     statusMessage = std::move(statusMessage)]() mutable {
 					    callback(requestSucceeded, identified, std::move(statusMessage));
@@ -644,7 +644,40 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 				failureCallback(false, false, "后台请求队列不可用");
 			}
 		},
-		[this, config]() { retryStartAfterFace(config); });
+		[this, session](UI::DialogFactory::FaceRetryCallback callback) {
+			const auto alive = m_alive;
+			const Bili::Config retryConfig = session->config;
+			auto failureCallback = callback;
+			if (!enqueue([alive, retryConfig, callback = std::move(callback), session]() mutable {
+				    StartAttempt result = startLive(retryConfig);
+				    postToUi(alive, [callback = std::move(callback), result = std::move(result),
+						     session]() mutable {
+					    const bool faceAuthRequired = !result.faceUrl.empty() &&
+									  result.faceAuthCode != 0;
+					    const auto decision =
+						    Core::classifyFaceAuthRetry(result.started, faceAuthRequired);
+					    if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
+						    session->config = result.config;
+						    session->faceUrl = result.faceUrl;
+						    session->faceAuthCode = result.faceAuthCode;
+						    callback(decision, result.faceUrl, {});
+						    return;
+					    }
+					    session->completedAttempt = std::move(result);
+					    session->hasCompletedAttempt = true;
+					    callback(decision, {}, session->completedAttempt.message);
+				    });
+			    })) {
+				session->completedAttempt.config = retryConfig;
+				session->completedAttempt.message = "后台请求队列不可用";
+				session->hasCompletedAttempt = true;
+				failureCallback(Core::FaceAuthRetryDecision::Failed, {},
+						session->completedAttempt.message);
+			}
+		});
+
+	if (completed && session->hasCompletedAttempt)
+		handleStartAttempt(std::move(session->completedAttempt));
 }
 
 void BilibiliStreamPlugin::onUpdateRoomInfo()

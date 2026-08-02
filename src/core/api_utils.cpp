@@ -104,6 +104,13 @@ bool jsonInteger(const json11::Json &value, int &result, int minimum)
 	return true;
 }
 
+FaceAuthRetryDecision classifyFaceAuthRetry(bool started, bool faceAuthRequired)
+{
+	if (started)
+		return FaceAuthRetryDecision::Started;
+	return faceAuthRequired ? FaceAuthRetryDecision::ContinueWaiting : FaceAuthRetryDecision::Failed;
+}
+
 bool shouldStopManagedSession(bool managedSession, bool statusKnown, bool isLive)
 {
 	return managedSession && (!statusKnown || isLive);
