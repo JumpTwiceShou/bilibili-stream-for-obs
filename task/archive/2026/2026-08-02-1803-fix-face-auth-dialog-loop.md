@@ -20,7 +20,7 @@
 - [x] Trace the exact 1.1.0 asynchronous face-auth state machine.
 - [x] Implement a single-dialog, no-reentry retry flow with correct auth-code propagation.
 - [x] Add and run focused regression validation.
-- [ ] Review the scoped diff, commit, and push to `sync/main`.
+- [x] Review the scoped diff, commit, and push to `sync/main`.
 
 ## Acceptance Criteria
 
@@ -47,18 +47,21 @@
 
 ## Blockers
 
-- None.
+- None. The local fresh-configure SDK-cache mismatch did not block validation because VM102 retained the supported configured Windows CI build and completed the compiler/test gate.
 
 ## Commits
 
-- Pending.
+- `1dea6c4` - `fix: keep face verification in one dialog`
 
 ## Device Sync
 
-- Current Windows: pending.
-- Windows VM102: pending.
-- Ubuntu VM101: pending.
+- Current Windows: `main` and private `sync/main` verified at `1dea6c4` with a clean worktree after push.
+- Windows VM102: fast-forwarded private `origin/main` to `1dea6c4`; clean worktree verified.
+- Ubuntu VM101: fast-forwarded private `origin/main` to `1dea6c4`; clean worktree verified.
 
 ## Final Result
 
-- Pending.
+- Fixed the face-auth QR flicker loop on the 1.1.0 asynchronous baseline. A positive status response now triggers a start-live confirmation while the original dialog remains open. Repeated `60024`/`60043` results update the same session and QR instead of opening another modal dialog.
+- Added offline decision coverage, localized retry/waiting messages, changelog and README documentation.
+- Windows build, 1/1 focused tests, formatting, locale parity, and diff checks passed.
+- The implementation commit was pushed only to the private development remote and synchronized to both reachable managed devices. Public `origin` and its 1.0.0 release were not changed.
