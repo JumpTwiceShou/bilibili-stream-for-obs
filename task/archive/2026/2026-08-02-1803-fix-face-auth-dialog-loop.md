@@ -64,4 +64,4 @@
 - Fixed the face-auth QR flicker loop on the 1.1.0 asynchronous baseline. A positive status response now triggers a start-live confirmation while the original dialog remains open. Repeated `60024`/`60043` results update the same session and QR instead of opening another modal dialog.
 - Added offline decision coverage, localized retry/waiting messages, changelog and README documentation.
 - Windows build, 1/1 focused tests, formatting, locale parity, and diff checks passed.
-- The implementation commit was pushed only to the private development remote and synchronized to both reachable managed devices. Public `origin` and its 1.0.0 release were not changed.
+- The implementation commit was pushed only to the private development remote and synchronized to both reachable managed devices. Live verification showed public `origin` already at `f9e8657` (tag `1.1.0`); it was not changed by this task.
