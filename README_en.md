@@ -4,6 +4,11 @@ This is an OBS Studio plugin for Bilibili live streaming. It supports QR-code lo
 
 The first public release of this repository is `1.0.0`. The basic workflow follows [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream), with additional behavior inspired by [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live).
 
+## Changes in 1.2.0
+
+- Fixed the face-verification QR window repeatedly closing and reopening when the verification-status and start-live responses disagree.
+- The plugin now keeps one face-verification window open until start-live succeeds or a terminal error occurs.
+
 ## Changes in 1.1.0
 
 - Starting a live session reads the current Bilibili room category instead of overwriting it with a hard-coded default.
@@ -17,7 +22,7 @@ The first public release of this repository is `1.0.0`. The basic workflow follo
 
 ### Windows
 
-1. Download `bilibili-stream-for-obs-1.1.0-windows-x64.zip` from this repository's [Releases page](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases).
+1. Download `bilibili-stream-for-obs-1.2.0-windows-x64.zip` from this repository's [Releases page](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases).
 2. Extract the archive.
 3. Move the extracted `bilibili-stream-for-obs` folder into:
 

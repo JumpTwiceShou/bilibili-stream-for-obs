@@ -4,7 +4,12 @@
 
 本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
 
-## 本版本改动
+## 1.2.0 更新
+
+- 修复人脸验证状态与开播结果不一致时二维码窗口反复关闭、重新弹出的问题。
+- 插件现在会保留同一个人脸验证窗口，只有开播成功或出现终止错误时才结束等待。
+
+## 1.1.0 更新
 
 - 开播时自动读取当前直播间分区，不再默认把直播间分区覆盖为“英雄联盟”。
 - “更新直播间信息”窗口会读取当前直播间标题和分区，并显示到输入框和分区选择框中。
@@ -17,7 +22,7 @@
 
 ### Windows
 
-1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.1.0-windows-x64.zip`。
+1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.2.0-windows-x64.zip`。
 2. 解压压缩包。
 3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
 
