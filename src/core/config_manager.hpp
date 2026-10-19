@@ -5,7 +5,7 @@
 namespace Core {
 class ConfigManager {
 public:
-	ConfigManager();
+	explicit ConfigManager(std::string configDirectory = {});
 	bool load();
 	bool save();
 	Bili::Config &config() { return m_config; }
@@ -13,6 +13,7 @@ public:
 
 private:
 	Bili::Config m_config;
+	std::string m_configDirectory;
 	char *getConfigPath() const;
 	char *getLegacyConfigPath() const;
 	bool loadSettings(obs_data_t *settings, bool legacyFormat, std::string &message);

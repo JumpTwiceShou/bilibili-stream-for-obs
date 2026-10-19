@@ -10,10 +10,12 @@
 #include <queue>
 #include <string_view>
 #include <thread>
+#include <chrono>
 
 #include <curl/curl.h>
 
 #include "plugin_utils.hpp"
+#include "core/login_utils.hpp"
 
 namespace Http {
 namespace {
@@ -30,6 +32,9 @@ std::condition_variable queueCondition;
 std::atomic_bool stopWorker{false};
 std::thread workerThread;
 bool initialized = false;
+std::mutex proxyMutex;
+bool proxyRequired = false;
+Proxy::Endpoint proxyEndpoint;
 
 size_t writeCallback(void *contents, size_t size, size_t count, void *userData)
 {
@@ -82,15 +87,35 @@ size_t headerCallback(char *buffer, size_t size, size_t count, void *userData)
 	return bytes;
 }
 
-int transferProgress(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+int transferProgress(void *data, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
 {
-	return stopWorker.load(std::memory_order_relaxed) ? 1 : 0;
+	const auto *endpoint = static_cast<const Proxy::Endpoint *>(data);
+	return stopWorker.load(std::memory_order_relaxed) || (endpoint && !endpoint->ready()) ? 1 : 0;
 }
 
 HttpResponse performRequest(const std::string &url, const std::string *postData,
-			    const std::vector<std::string> &headers, long timeoutMs)
+			    const std::vector<std::string> &headers, long timeoutMs,
+			    const Proxy::Endpoint *explicitEndpoint = nullptr, bool loginTicket = false)
 {
 	HttpResponse response;
+	if (loginTicket && !Core::trustedLoginUrl(url)) {
+		response.data = "登录跳转地址不受信任，已停止获取登录凭据";
+		return response;
+	}
+	bool useProxy;
+	Proxy::Endpoint endpoint;
+	if (explicitEndpoint) {
+		useProxy = true;
+		endpoint = *explicitEndpoint;
+	} else {
+		std::lock_guard<std::mutex> lock(proxyMutex);
+		useProxy = proxyRequired;
+		endpoint = proxyEndpoint;
+	}
+	if (useProxy && !endpoint.ready()) {
+		response.data = "代理未就绪；已阻止 B 站接口直连，请检查代理设置。";
+		return response;
+	}
 	CURL *curl = curl_easy_init();
 	if (!curl) {
 		response.data = "CURL 初始化失败";
@@ -101,6 +126,14 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 	std::string responseCookies;
 	WriteContext writeContext{&responseData};
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	const std::string proxy = "socks5h://127.0.0.1:" + std::to_string(endpoint.port);
+	const std::string proxyUser = endpoint.user.toStdString(), proxyPassword = endpoint.password.toStdString();
+	curl_easy_setopt(curl, CURLOPT_PROXY, useProxy ? proxy.c_str() : "");
+	if (useProxy) {
+		curl_easy_setopt(curl, CURLOPT_NOPROXY, "");
+		curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, proxyUser.c_str());
+		curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, proxyPassword.c_str());
+	}
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &writeContext);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
@@ -108,7 +141,10 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeoutMs);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (std::min)(timeoutMs, 5000L));
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, loginTicket ? 0L : 1L);
+	if (loginTicket)
+		curl_easy_setopt(curl, CURLOPT_COOKIEFILE,
+				 ""); // In-memory, domain-scoped cookies; never a cookie file.
 	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
 #if LIBCURL_VERSION_NUM >= 0x075500
 	curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
@@ -119,6 +155,7 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 #endif
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferProgress);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, useProxy ? &endpoint : nullptr);
 	if (postData) {
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData->data());
@@ -130,8 +167,53 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 		headerList = curl_slist_append(headerList, header.c_str());
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
 
-	const CURLcode result = curl_easy_perform(curl);
+	CURLcode result = CURLE_OK;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+	for (int redirects = 0;; ++redirects) {
+		if (stopWorker.load(std::memory_order_relaxed) || (useProxy && !endpoint.ready())) {
+			result = CURLE_ABORTED_BY_CALLBACK;
+			break;
+		}
+		if (loginTicket) {
+			const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+						       deadline - std::chrono::steady_clock::now())
+						       .count();
+			if (remaining <= 0) {
+				result = CURLE_OPERATION_TIMEDOUT;
+				break;
+			}
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
+					 (std::min)(static_cast<long>(remaining), 5000L));
+		}
+		result = curl_easy_perform(curl);
+		if (!loginTicket || result != CURLE_OK)
+			break;
+		char *redirect = nullptr;
+		curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirect);
+		if (!redirect)
+			break;
+		if (redirects >= 5) {
+			result = CURLE_TOO_MANY_REDIRECTS;
+			break;
+		}
+		if (!Core::trustedLoginUrl(redirect)) {
+			result = CURLE_URL_MALFORMAT;
+			break;
+		}
+		const std::string next(redirect);
+		curl_easy_setopt(curl, CURLOPT_URL, next.c_str());
+		responseData.clear();
+	}
+	if (useProxy) {
+		curl_off_t up = 0, down = 0;
+		curl_easy_getinfo(curl, CURLINFO_SIZE_UPLOAD_T, &up);
+		curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &down);
+		endpoint.counters->uploaded.fetch_add(static_cast<quint64>((std::max)(up, curl_off_t(0))));
+		endpoint.counters->downloaded.fetch_add(static_cast<quint64>((std::max)(down, curl_off_t(0))));
+	}
 	if (result != CURLE_OK) {
+		response.networkError = int(result);
 		response.timeout = result == CURLE_OPERATION_TIMEDOUT;
 		response.cancelled = result == CURLE_ABORTED_BY_CALLBACK && stopWorker.load(std::memory_order_relaxed);
 		if (writeContext.overflow) {
@@ -174,6 +256,13 @@ void workerLoop()
 	}
 }
 } // namespace
+
+void HttpClient::setProxy(bool required, const Proxy::Endpoint &endpoint)
+{
+	std::lock_guard<std::mutex> lock(proxyMutex);
+	proxyRequired = required;
+	proxyEndpoint = endpoint;
+}
 
 bool HttpClient::init()
 {
@@ -229,6 +318,17 @@ bool HttpClient::enqueue(std::function<void()> task)
 HttpResponse HttpClient::get(const std::string &url, const std::vector<std::string> &headers, long timeoutMs)
 {
 	return performRequest(url, nullptr, headers, timeoutMs);
+}
+
+HttpResponse HttpClient::getLoginTicket(const std::string &url, const std::vector<std::string> &headers, long timeoutMs)
+{
+	return performRequest(url, nullptr, headers, timeoutMs, nullptr, true);
+}
+
+HttpResponse HttpClient::getViaProxy(const std::string &url, const Proxy::Endpoint &endpoint,
+				     const std::vector<std::string> &headers, long timeoutMs)
+{
+	return performRequest(url, nullptr, headers, timeoutMs, &endpoint);
 }
 
 HttpResponse HttpClient::post(const std::string &url, const std::string &data, const std::vector<std::string> &headers,

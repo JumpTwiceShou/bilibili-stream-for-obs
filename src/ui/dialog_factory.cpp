@@ -1,7 +1,5 @@
 #include "ui/dialog_factory.hpp"
 
-#include <QApplication>
-#include <QClipboard>
 #include <QComboBox>
 #include <QDialog>
 #include <QElapsedTimer>
@@ -23,6 +21,24 @@
 
 namespace UI {
 namespace {
+class FaceDialog : public QDialog {
+public:
+	using QDialog::QDialog;
+	void reject() override
+	{
+		if (!property("startPending").toBool())
+			QDialog::reject();
+	}
+};
+class RoomDialog : public QDialog {
+public:
+	using QDialog::QDialog;
+	void reject() override
+	{
+		if (!property("operationPending").toBool())
+			QDialog::reject();
+	}
+};
 void configureDialog(QDialog &dialog, const QString &title)
 {
 	dialog.setWindowTitle(title);
@@ -90,6 +106,7 @@ void DialogFactory::qrLogin(QWidget *parent, const std::string &qrData, QrPollRe
 	dialogLayout(dialog)->addWidget(qrLabel);
 	dialogLayout(dialog)->addWidget(new QLabel(text("Qr.Instruction")));
 	QLabel *statusLabel = new QLabel(text("Qr.Waiting"));
+	statusLabel->setTextFormat(Qt::PlainText);
 	statusLabel->setAlignment(Qt::AlignCenter);
 	statusLabel->setWordWrap(true);
 	dialogLayout(dialog)->addWidget(statusLabel);
@@ -138,34 +155,10 @@ void DialogFactory::qrLogin(QWidget *parent, const std::string &qrData, QrPollRe
 	dialog.exec();
 }
 
-void DialogFactory::streamStarted(QWidget *parent, const std::string &rtmpAddr, const std::string &rtmpCode)
-{
-	QDialog dialog(parent);
-	configureDialog(dialog, text("Common.Message"));
-	QLabel *credentials = new QLabel(
-		text("Stream.Credentials").arg(QString::fromStdString(rtmpAddr), QString::fromStdString(rtmpCode)));
-	credentials->setTextFormat(Qt::PlainText);
-	credentials->setTextInteractionFlags(Qt::TextSelectableByMouse);
-	credentials->setWordWrap(true);
-	dialogLayout(dialog)->addWidget(credentials);
-
-	QPushButton *copy = new QPushButton(text("Common.Copy"));
-	QPushButton *confirm = new QPushButton(text("Common.Confirm"));
-	dialogLayout(dialog)->addWidget(copy);
-	dialogLayout(dialog)->addWidget(confirm);
-	QObject::connect(copy, &QPushButton::clicked, &dialog, [rtmpAddr, rtmpCode]() {
-		QApplication::clipboard()->setText(
-			text("Stream.Clipboard")
-				.arg(QString::fromStdString(rtmpAddr), QString::fromStdString(rtmpCode)));
-	});
-	QObject::connect(confirm, &QPushButton::clicked, &dialog, &QDialog::accept);
-	dialog.exec();
-}
-
 bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
 			     FaceRetryRequest requestRetry)
 {
-	QDialog dialog(parent);
+	FaceDialog dialog(parent);
 	configureDialog(dialog, text("Face.Title"));
 	QLabel *qrLabel = new QLabel();
 	const QPixmap pixmap = Core::QrGenerator::generate(faceUrl);
@@ -187,8 +180,16 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	dialogLayout(dialog)->addWidget(statusLabel);
 	dialogLayout(dialog)->addWidget(closeButton);
 
+	auto *retryButton = new QPushButton(text("Face.ManualRetry"));
+	dialogLayout(dialog)->insertWidget(3, retryButton);
+	auto *detail = new QLabel;
+	detail->setWordWrap(true);
+	detail->setTextFormat(Qt::PlainText);
+	dialogLayout(dialog)->insertWidget(3, detail);
 	struct PollState {
 		bool inFlight = false;
+		bool positiveConsumed = false;
+		int positiveCount = 0;
 		QElapsedTimer elapsed;
 	};
 	auto state = std::make_shared<PollState>();
@@ -196,51 +197,71 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	QTimer timer(&dialog);
 	timer.setInterval(5000);
 	QPointer<QDialog> guard(&dialog);
-	const auto poll = [guard, state, &timer, qrLabel, statusLabel, requestPoll, requestRetry]() {
+	const auto retry = [guard, state, &timer, qrLabel, statusLabel, detail, retryButton, requestRetry]() {
+		if (!guard || state->inFlight)
+			return;
+		state->inFlight = true;
+		state->positiveConsumed = true;
+		retryButton->setEnabled(false);
+		guard->setProperty("startPending", true);
+		requestRetry([guard, state, &timer, qrLabel, statusLabel, detail,
+			      retryButton](Core::FaceAuthRetryDecision decision, std::string retryFaceUrl,
+					   std::string retryMessage) {
+			if (!guard)
+				return;
+			state->inFlight = false;
+			guard->setProperty("startPending", false);
+			retryButton->setEnabled(true);
+			if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
+				if (!retryFaceUrl.empty()) {
+					const QPixmap retryPixmap = Core::QrGenerator::generate(retryFaceUrl);
+					if (!retryPixmap.isNull())
+						qrLabel->setPixmap(retryPixmap);
+				}
+				// A stale positive must not repeatedly invoke startLive. Rearm only after pending -> success.
+				detail->setText(text("Face.ManualHint"));
+				return;
+			}
+			timer.stop();
+			if (decision == Core::FaceAuthRetryDecision::Started)
+				guard->accept();
+			else {
+				statusLabel->setText(text("Dialog.StartFailed"));
+				detail->setText(QString::fromStdString(retryMessage));
+				retryButton->setEnabled(false);
+			}
+		});
+	};
+	const auto poll = [guard, state, &timer, statusLabel, detail, retryButton, requestPoll, retry]() {
 		if (!guard || state->inFlight)
 			return;
 		if (state->elapsed.elapsed() > 600000) {
 			timer.stop();
 			statusLabel->setText(text("Face.Timeout"));
+			retryButton->setEnabled(false);
 			return;
 		}
 		state->inFlight = true;
-		requestPoll([guard, state, &timer, qrLabel, statusLabel,
-			     requestRetry](bool requestSucceeded, bool identified, std::string statusMessage) {
+		requestPoll([guard, state, detail, retryButton, retry](bool succeeded, bool identified, std::string) {
 			if (!guard)
 				return;
-			if (!statusMessage.empty())
-				statusLabel->setText(QString::fromUtf8(statusMessage));
-			if (!requestSucceeded || !identified) {
-				state->inFlight = false;
+			state->inFlight = false;
+			if (!succeeded) {
+				state->positiveCount = 0;
+				detail->setText(text("Face.StatusUnavailable"));
 				return;
 			}
-
-			statusLabel->setText(text("Face.Retrying"));
-			requestRetry([guard, state, &timer, qrLabel, statusLabel](Core::FaceAuthRetryDecision decision,
-										  std::string retryFaceUrl,
-										  std::string retryMessage) {
-				if (!guard)
-					return;
-				if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
-					if (!retryFaceUrl.empty()) {
-						const QPixmap retryPixmap = Core::QrGenerator::generate(retryFaceUrl);
-						if (retryPixmap.isNull())
-							qrLabel->setText(text("Face.GenerateFailed"));
-						else
-							qrLabel->setPixmap(retryPixmap);
-					}
-					statusLabel->setText(retryMessage.empty() ? text("Face.StillRequired")
-										  : QString::fromUtf8(retryMessage));
-					state->inFlight = false;
-					return;
-				}
-
-				timer.stop();
-				guard->accept();
-			});
+			if (!identified) {
+				state->positiveConsumed = false;
+				state->positiveCount = 0;
+				detail->clear();
+				return;
+			}
+			if (!state->positiveConsumed && ++state->positiveCount >= 2)
+				retry();
 		});
 	};
+	QObject::connect(retryButton, &QPushButton::clicked, &dialog, retry);
 	QObject::connect(&timer, &QTimer::timeout, &dialog, poll);
 	QObject::connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::reject);
 	timer.start();
@@ -250,12 +271,13 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 
 void DialogFactory::roomSettings(QWidget *parent, const std::string &roomUrl, const std::string &currentTitle,
 				 int currentAreaId, int currentPartId, const json11::Json &partitionData,
-				 std::function<void(const std::string &title, int areaId, int partId)> onApply)
+				 RoomApplyRequest onApply)
 {
-	QDialog dialog(parent);
+	RoomDialog dialog(parent);
 	configureDialog(dialog, text("Room.DialogTitle"));
 	dialogLayout(dialog)->addWidget(new QLabel(text("Room.Url").arg(QString::fromStdString(roomUrl))));
 	QLineEdit *titleInput = new QLineEdit(QString::fromStdString(currentTitle));
+	titleInput->setObjectName("roomTitle");
 	QHBoxLayout *titleRow = new QHBoxLayout();
 	titleRow->addWidget(new QLabel(text("Room.TitleLabel")));
 	titleRow->addWidget(titleInput);
@@ -263,13 +285,26 @@ void DialogFactory::roomSettings(QWidget *parent, const std::string &roomUrl, co
 
 	QComboBox *partCombo = new QComboBox();
 	QComboBox *areaCombo = new QComboBox();
+	partCombo->setObjectName("roomParentArea");
+	areaCombo->setObjectName("roomArea");
 	QHBoxLayout *partitionRow = new QHBoxLayout();
 	partitionRow->addWidget(new QLabel(text("Room.AreaLabel")));
 	partitionRow->addWidget(partCombo);
 	partitionRow->addWidget(areaCombo);
 	dialogLayout(dialog)->addLayout(partitionRow);
 	QPushButton *confirmChanges = new QPushButton(text("Room.Apply"));
+	confirmChanges->setObjectName("applyRoomChanges");
 	dialogLayout(dialog)->addWidget(confirmChanges);
+	auto *feedback = new QLabel;
+	feedback->setObjectName("roomApplyFeedback");
+	feedback->setWordWrap(true);
+	feedback->setTextFormat(Qt::PlainText);
+	feedback->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	dialogLayout(dialog)->addWidget(feedback);
+	auto *close = new QPushButton(text("Common.Close"));
+	close->setObjectName("closeRoomSettings");
+	dialogLayout(dialog)->addWidget(close);
+	QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::reject);
 
 	struct Part {
 		int id;
@@ -323,12 +358,60 @@ void DialogFactory::roomSettings(QWidget *parent, const std::string &roomUrl, co
 	};
 	updateAreaCombo(static_cast<int>(selectedPartIndex));
 	QObject::connect(partCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, updateAreaCombo);
-	QObject::connect(confirmChanges, &QPushButton::clicked, &dialog, [=, &dialog]() {
-		if (onApply) {
-			onApply(titleInput->text().trimmed().toUtf8().constData(), areaCombo->currentData().toInt(),
-				partCombo->currentData().toInt());
+	struct ApplyState {
+		std::string title;
+		int areaId, partId;
+		bool pending = false;
+	};
+	auto state = std::make_shared<ApplyState>(ApplyState{currentTitle, currentAreaId, currentPartId, false});
+	const QPointer<RoomDialog> guard(&dialog);
+	auto setPending = [=](bool pending) {
+		state->pending = pending;
+		if (!guard)
+			return;
+		guard->setProperty("operationPending", pending);
+		QWidget *widgets[]{titleInput, partCombo, areaCombo, confirmChanges, close};
+		for (auto *widget : widgets)
+			widget->setEnabled(!pending);
+		confirmChanges->setText(text(pending ? "Room.Applying" : "Room.Apply"));
+	};
+	QObject::connect(confirmChanges, &QPushButton::clicked, &dialog, [=]() {
+		if (state->pending || !onApply)
+			return;
+		RoomChanges changes{state->title,
+				    titleInput->text().trimmed().toUtf8().constData(),
+				    state->areaId,
+				    state->partId,
+				    areaCombo->currentData().toInt(),
+				    partCombo->currentData().toInt()};
+		if ((changes.title.empty() || changes.title == changes.baseTitle) &&
+		    (changes.areaId <= 0 ||
+		     (changes.areaId == changes.baseAreaId && changes.partId == changes.basePartId))) {
+			feedback->setText(text("Room.NoChanges"));
+			return;
 		}
-		dialog.accept();
+		setPending(true);
+		feedback->setText(text("Room.Applying"));
+		onApply(changes, [=](RoomApplyResult result) {
+			if (!guard || !state->pending)
+				return;
+			setPending(false);
+			QStringList messages;
+			if (result.titleUpdated) {
+				state->title = changes.title;
+				messages.append(text("Room.TitleUpdated"));
+			}
+			if (result.areaUpdated) {
+				state->areaId = changes.areaId;
+				state->partId = changes.partId;
+				messages.append(text("Room.AreaUpdated"));
+			}
+			if (!result.message.empty())
+				messages.append(QString::fromUtf8(result.message));
+			if (messages.isEmpty())
+				messages.append(text("Room.ApplyFailed"));
+			feedback->setText(messages.join(QStringLiteral("\n")));
+		});
 	});
 	dialog.exec();
 }

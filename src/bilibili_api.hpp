@@ -17,6 +17,10 @@ struct Config {
 	std::string title;
 	bool login_status = false;
 	bool managed_session = false;
+	bool sync_obs_start = true;
+	bool sync_obs_stop = true;
+	bool proxy_unlocked = false;
+	std::string last_rtmp_address, last_rtmp_key, selected_rtmp_address;
 	int part_id = 0;
 	int area_id = 0;
 };

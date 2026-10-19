@@ -4,6 +4,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QString>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <obs-module.h>
 
 #include "core/api_utils.hpp"
@@ -11,15 +13,19 @@
 #include "plugin_utils.hpp"
 
 namespace Core {
-ConfigManager::ConfigManager() {}
+ConfigManager::ConfigManager(std::string configDirectory) : m_configDirectory(std::move(configDirectory)) {}
 
 char *ConfigManager::getConfigPath() const
 {
+	if (!m_configDirectory.empty())
+		return bstrdup((m_configDirectory + "/config.json").c_str());
 	return obs_module_config_path("config.json");
 }
 
 char *ConfigManager::getLegacyConfigPath() const
 {
+	if (!m_configDirectory.empty())
+		return bstrdup((m_configDirectory + "/legacy.json").c_str());
 	return obs_module_file("config.json");
 }
 
@@ -28,6 +34,21 @@ bool ConfigManager::loadSettings(obs_data_t *settings, bool legacyFormat, std::s
 	m_config.room_id = obs_data_get_string(settings, "room_id");
 	m_config.mid = obs_data_get_string(settings, "mid");
 	m_config.title = obs_data_get_string(settings, "title");
+	obs_data_set_default_bool(settings, "sync_obs_start", true);
+	obs_data_set_default_bool(settings, "sync_obs_stop", true);
+	m_config.sync_obs_start = obs_data_get_bool(settings, "sync_obs_start");
+	m_config.sync_obs_stop = obs_data_get_bool(settings, "sync_obs_stop");
+	m_config.proxy_unlocked = obs_data_get_bool(settings, "proxy_unlocked");
+	const std::string protectedStream = obs_data_get_string(settings, "stream_credentials_protected");
+	if (!protectedStream.empty()) {
+		std::string plain;
+		if (!unprotectSecret(protectedStream, plain, message))
+			return false;
+		const auto credentials = QJsonDocument::fromJson(QByteArray::fromStdString(plain)).object();
+		m_config.last_rtmp_address = credentials["address"].toString().toStdString();
+		m_config.last_rtmp_key = credentials["key"].toString().toStdString();
+		m_config.selected_rtmp_address = credentials["selected"].toString().toStdString();
+	}
 	m_config.managed_session = obs_data_get_bool(settings, "managed_session") ||
 				   (legacyFormat && obs_data_get_bool(settings, "streaming"));
 	m_config.part_id = static_cast<int>(obs_data_get_int(settings, "part_id"));
@@ -130,11 +151,25 @@ bool ConfigManager::save()
 	}
 
 	obs_data_t *settings = obs_data_create();
+	std::string protectedStream;
+	const QJsonObject credentials{{"address", QString::fromStdString(m_config.last_rtmp_address)},
+				      {"key", QString::fromStdString(m_config.last_rtmp_key)},
+				      {"selected", QString::fromStdString(m_config.selected_rtmp_address)}};
+	if (!protectSecret(QJsonDocument(credentials).toJson(QJsonDocument::Compact).toStdString(), protectedStream,
+			   message)) {
+		obs_data_release(settings);
+		bfree(configFile);
+		return false;
+	}
+	obs_data_set_string(settings, "stream_credentials_protected", protectedStream.c_str());
+	obs_data_set_bool(settings, "proxy_unlocked", m_config.proxy_unlocked);
 	obs_data_set_string(settings, "room_id", m_config.room_id.c_str());
 	obs_data_set_string(settings, "mid", m_config.mid.c_str());
 	obs_data_set_string(settings, "title", m_config.title.c_str());
 	obs_data_set_string(settings, "cookies_protected", protectedCookies.c_str());
 	obs_data_set_bool(settings, "managed_session", m_config.managed_session);
+	obs_data_set_bool(settings, "sync_obs_start", m_config.sync_obs_start);
+	obs_data_set_bool(settings, "sync_obs_stop", m_config.sync_obs_stop);
 	obs_data_set_int(settings, "part_id", m_config.part_id);
 	obs_data_set_int(settings, "area_id", m_config.area_id);
 	const bool saved = obs_data_save_json_safe(settings, configFile, "tmp", "bak");

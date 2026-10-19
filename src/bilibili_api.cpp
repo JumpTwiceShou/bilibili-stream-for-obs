@@ -1,8 +1,10 @@
 ﻿#include "bilibili_api.hpp"
 #include "core/api_utils.hpp"
+#include "core/login_utils.hpp"
 #include "http_client.hpp"
 #include "md5.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include "plugin_utils.hpp"
@@ -43,6 +45,26 @@ bool requireSuccessfulResponse(const Http::HttpResponse &response, const char *a
 		: response.cancelled ? " (cancelled)"
 				     : "");
 	return false;
+}
+
+bool readApiReply(const Http::HttpResponse &response, const char *action, json11::Json &json, std::string &message,
+		  int *responseCode = nullptr)
+{
+	std::string error;
+	json = json11::Json::parse(response.data, error);
+	int code = 0;
+	if (!error.empty() || !Core::apiResponseCode(json, code)) {
+		message = std::string(action) + "失败: 响应不是有效的 API 数据";
+		return false;
+	}
+	if (responseCode) {
+		*responseCode = code;
+	} else if (code != 0) {
+		message = Core::apiErrorMessage(json, action);
+		obs_log(LOG_WARNING, "%s failed with API code %d", action, code);
+		return false;
+	}
+	return true;
 }
 } // namespace
 
@@ -99,10 +121,8 @@ bool BiliApi::getQrCode(const std::string &cookies, std::string &qr_data, std::s
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		message = "Json 解析失败: " + err;
+	json11::Json json;
+	if (!readApiReply(response, "获取二维码", json, message)) {
 		return false;
 	}
 
@@ -119,6 +139,7 @@ bool BiliApi::getQrCode(const std::string &cookies, std::string &qr_data, std::s
 
 BiliApi::QrLoginResult BiliApi::qrLogin(const std::string &qr_key, std::string &cookies, std::string &message)
 {
+	cookies.clear();
 	std::string url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=" +
 			  Core::encodeFormComponent(qr_key);
 	auto response = Http::HttpClient::get(url, default_headers);
@@ -126,18 +147,19 @@ BiliApi::QrLoginResult BiliApi::qrLogin(const std::string &qr_key, std::string &
 		return QrLoginResult::Error;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		obs_log(LOG_ERROR, "JSON 解析失败: %s", err.c_str());
-		message = "JSON 解析失败: " + err;
+	json11::Json json;
+	if (!readApiReply(response, "检查二维码登录状态", json, message)) {
 		return QrLoginResult::Error;
 	}
 
-	int code = json["data"]["code"].int_value();
+	int code = -1;
+	if (!Core::jsonInteger(json["data"]["code"], code)) {
+		message = "检查二维码登录状态失败: 缺少有效的扫码状态";
+		return QrLoginResult::Error;
+	}
 	if (code != 0) {
 		if (code == 86038) {
-			message = "二维码已失效: " + json["message"].string_value();
+			message = "二维码已失效，请重新扫码";
 			return QrLoginResult::Expired;
 		} else if (code == 86090) {
 			message = "二维码已扫描，等待确认";
@@ -146,48 +168,31 @@ BiliApi::QrLoginResult BiliApi::qrLogin(const std::string &qr_key, std::string &
 			message = "等待扫描二维码";
 			return QrLoginResult::Pending;
 		} else {
-			obs_log(LOG_ERROR, "API 返回错误，code: %d, message: %s", code,
-				json["message"].string_value().c_str());
-			message = "API 返回错误，code: " + std::to_string(code) +
-				  ", message: " + json["message"].string_value();
+			message = Core::apiErrorMessage(json["data"], "二维码登录");
 			return QrLoginResult::Error;
 		}
 	}
 
-	cookies = response.cookies;
-	if (cookies.empty()) {
-		std::string loginUrl = json["data"]["url"].string_value();
-		if (!loginUrl.empty()) {
-			obs_log(LOG_INFO, "从 URL 解析 Cookies...");
-
-			auto extractParam = [&](const std::string &key) -> std::string {
-				std::string search = key + "=";
-				size_t start = loginUrl.find(search);
-				if (start == std::string::npos)
-					return "";
-				start += search.length();
-				size_t end = loginUrl.find("&", start);
-				if (end == std::string::npos)
-					end = loginUrl.length();
-				return loginUrl.substr(start, end - start);
-			};
-
-			std::string sessData = extractParam("SESSDATA");
-			std::string biliJct = extractParam("bili_jct"); // 即 csrf
-			std::string dedeUserId = extractParam("DedeUserID");
-
-			if (!sessData.empty() && !biliJct.empty()) {
-				cookies = "SESSDATA=" + sessData + "; bili_jct=" + biliJct +
-					  "; DedeUserID=" + dedeUserId + ";";
-			}
+	std::string candidate = Core::mergeLoginCookies({}, response.cookies);
+	const std::string loginUrl = json["data"]["url"].string_value();
+	if (!Core::completeLoginCookies(candidate))
+		candidate = Core::mergeLoginCookies(Core::legacyLoginCookies(loginUrl), candidate);
+	if (!Core::completeLoginCookies(candidate) && !loginUrl.empty()) {
+		if (!Core::trustedLoginUrl(loginUrl)) {
+			message = "二维码登录失败: 返回的登录跳转地址无效";
+			return QrLoginResult::Error;
 		}
+		const auto ticket = Http::HttpClient::getLoginTicket(loginUrl, default_headers);
+		if (!requireSuccessfulResponse(ticket, "获取登录凭据", message))
+			return QrLoginResult::Error;
+		candidate = Core::mergeLoginCookies(candidate, ticket.cookies);
 	}
-	if (cookies.empty()) {
-		obs_log(LOG_ERROR, "无法获取登录 Cookies");
-		message = "无法获取登录 Cookies";
+	if (!Core::completeLoginCookies(candidate)) {
+		message = "二维码已确认，但未获取到完整登录凭据，请重新扫码";
 		return QrLoginResult::Error;
 	}
 
+	cookies = std::move(candidate);
 	message = "二维码登录成功";
 	return QrLoginResult::Success;
 }
@@ -201,17 +206,34 @@ bool BiliApi::checkLoginStatus(const std::string &cookies, bool &is_logged_in, s
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		obs_log(LOG_ERROR, "JSON 解析失败: %s", err.c_str());
-		message = "JSON 解析失败: " + err;
+	json11::Json json;
+	std::string parseError;
+	const auto statusReply = json11::Json::parse(response.data, parseError);
+	int statusCode = 0;
+	if (parseError.empty() && Core::apiResponseCode(statusReply, statusCode) && statusCode == -101) {
+		mid.clear();
+		message = "Bilibili 登录已失效，请重新扫码登录";
+		return true;
+	}
+	if (!readApiReply(response, "检查登录状态", json, message)) {
+		return false;
+	}
+	if (!json["data"]["isLogin"].is_bool()) {
+		message = "检查登录状态失败: 缺少有效的登录状态";
 		return false;
 	}
 
 	is_logged_in = json["data"]["isLogin"].bool_value();
 	if (is_logged_in) {
-		mid = std::to_string(static_cast<long long>(json["data"]["mid"].number_value()));
+		const auto &id = json["data"]["mid"];
+		const double number = id.number_value();
+		if (!id.is_number() || !std::isfinite(number) || std::floor(number) != number || number <= 0 ||
+		    number > 9007199254740991.0) {
+			is_logged_in = false;
+			message = "检查登录状态失败: 缺少有效的账号标识";
+			return false;
+		}
+		mid = std::to_string(static_cast<long long>(number));
 	}
 	obs_log(LOG_INFO, "检查登录状态: %s", is_logged_in ? "已登录" : "未登录");
 	message = "检查登录状态: " + std::string(is_logged_in ? "已登录" : "未登录");
@@ -242,24 +264,18 @@ bool BiliApi::getRoomIdAndCsrf(const std::string &cookies, std::string &room_id,
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		obs_log(LOG_ERROR, "JSON 解析失败: %s", err.c_str());
-		message = "Json 解析失败: " + err;
-		return false;
-	}
-	if (json["code"].int_value() != 0) {
-		obs_log(LOG_ERROR, "API 返回错误，code: %d, message: %s", json["code"].int_value(),
-			json["message"].string_value().c_str());
-		message = "API 返回错误， code: " + std::to_string(json["code"].int_value()) +
-			  ", message: " + json["message"].string_value();
+	json11::Json json;
+	if (!readApiReply(response, "获取房间号", json, message)) {
 		return false;
 	}
 
 	int parsedRoomId = 0;
-	if (!Core::jsonInteger(json["data"]["room_id"], parsedRoomId, 1)) {
+	if (!Core::jsonInteger(json["data"]["room_id"], parsedRoomId)) {
 		message = "获取房间号失败: 返回的房间号无效";
+		return false;
+	}
+	if (parsedRoomId == 0) {
+		message = "该账号尚未开通直播间，请先在 Bilibili 直播中心开通直播间后重试。";
 		return false;
 	}
 	room_id = std::to_string(parsedRoomId);
@@ -287,16 +303,8 @@ bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std:
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		obs_log(LOG_ERROR, "获取当前直播间信息 JSON 解析失败: %s", err.c_str());
-		message = "获取当前直播间信息 JSON 解析失败: " + err;
-		return false;
-	}
-
-	if (json["code"].int_value() != 0) {
-		message = "获取当前直播间信息失败: " + json["message"].string_value();
+	json11::Json json;
+	if (!readApiReply(response, "获取当前直播间信息", json, message)) {
 		return false;
 	}
 
@@ -327,6 +335,7 @@ bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std:
 
 bool BiliApi::getLiveStatus(const Config &config, bool &is_live, std::string &message)
 {
+	is_live = false;
 	std::string mid = config.mid;
 	if (mid.empty()) {
 		mid = Core::extractCookieValue(config.cookies, "DedeUserID");
@@ -345,25 +354,18 @@ bool BiliApi::getLiveStatus(const Config &config, bool &is_live, std::string &me
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		obs_log(LOG_ERROR, "查询直播状态 JSON 解析失败: %s", err.c_str());
-		message = "查询直播状态 JSON 解析失败: " + err;
+	json11::Json json;
+	if (!readApiReply(response, "查询直播状态", json, message)) {
 		return false;
 	}
 
-	if (json["code"].int_value() != 0) {
-		message = "查询直播状态失败: " + json["message"].string_value();
+	int status = -1;
+	if (!Core::jsonInteger(json["data"]["liveStatus"], status) || status > 2) {
+		message = "查询直播状态失败: 返回的直播状态无效";
 		return false;
 	}
 
-	if (json["data"].is_null()) {
-		message = "查询直播状态失败: 返回数据为空";
-		return false;
-	}
-
-	is_live = json["data"]["liveStatus"].int_value() == 1;
+	is_live = status == 1;
 	message = is_live ? "当前直播状态: 直播中" : "当前直播状态: 未开播";
 	obs_log(LOG_INFO, "%s", message.c_str());
 	return true;
@@ -376,13 +378,11 @@ json11::Json BiliApi::getPartitionList(std::string &message)
 		return json11::Json();
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty() || json["code"].int_value() != 0 || !json["data"].is_array()) {
-		const std::string detail = !err.empty()                              ? err
-					   : !json["message"].string_value().empty() ? json["message"].string_value()
-										     : "无数据数组";
-		message = "解析分区列表失败: " + detail;
+	json11::Json json;
+	if (!readApiReply(response, "获取分区列表", json, message))
+		return json11::Json();
+	if (!json["data"].is_array()) {
+		message = "获取分区列表失败: 响应中缺少分区数组";
 		return json11::Json();
 	}
 	message = "获取分区列表成功";
@@ -394,6 +394,8 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 {
 	face_qr.clear();
 	face_auth_code = 0;
+	rtmp_addr.clear();
+	rtmp_code.clear();
 	if (config.room_id.empty() || config.csrf_token.empty()) {
 		obs_log(LOG_ERROR, "Start-live configuration is incomplete");
 		message = "开播配置无效，请重新登录并更新直播间信息";
@@ -413,17 +415,14 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(version_response.data, err);
-	if (!err.empty() || json["code"].int_value() != 0) {
-		obs_log(LOG_ERROR, "获取直播版本信息失败: %s", err.c_str());
-		message = "解析直播版本信息失败: " + (err.empty() ? json["message"].string_value() : err);
+	json11::Json json;
+	if (!readApiReply(version_response, "获取直播版本信息", json, message)) {
 		return false;
 	}
 
-	long build = json["data"]["build"].int_value();
+	int build = 0;
 	std::string curr_version = json["data"]["curr_version"].string_value();
-	if (build == 0 || curr_version.empty()) {
+	if (!Core::jsonInteger(json["data"]["build"], build, 1) || curr_version.empty()) {
 		obs_log(LOG_ERROR, "无效的 build 或 curr_version");
 		message = "无效的 build 或 curr_version";
 		return false;
@@ -446,15 +445,15 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 		return false;
 	}
 
-	err.clear();
-	json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		message = "启动直播响应解析失败: " + err;
+	int code = 0;
+	if (!readApiReply(response, "启动直播", json, message, &code)) {
 		return false;
 	}
-	int code = json["code"].int_value();
 	if (code != 0) {
-		message = json["message"].string_value();
+		message = Core::apiErrorMessage(json, "启动直播");
+		// Preserve the actionable restriction message before classifying numeric face-auth codes.
+		if (Core::isIpFollowerRestriction(message))
+			return false;
 
 		if (code == 60024) {
 			std::string face_url = json["data"]["qr"].string_value();
@@ -489,6 +488,7 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
 					 std::string &message)
 {
+	is_identified = false;
 	if (config.room_id.empty() || config.csrf_token.empty() || face_auth_code <= 0) {
 		message = "查询人脸认证状态失败: 配置或认证类型无效";
 		return false;
@@ -505,19 +505,15 @@ bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_cod
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty()) {
-		message = "查询人脸认证状态 JSON 解析失败: " + err;
+	json11::Json json;
+	if (!readApiReply(response, "查询人脸认证状态", json, message)) {
 		return false;
 	}
 
-	if (json["code"].int_value() != 0) {
-		message = "查询人脸认证状态失败: " + json["message"].string_value();
+	if (!Core::faceAuthIdentified(json, is_identified)) {
+		message = "查询人脸认证状态失败: 无效的认证状态响应";
 		return false;
 	}
-
-	is_identified = json["data"]["is_identified"].bool_value();
 	message = is_identified ? "人脸认证已完成，正在自动开播..." : "等待人脸认证完成...";
 	return true;
 }
@@ -534,12 +530,8 @@ bool BiliApi::stopLive(const Config &config, std::string &message)
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty() || json["code"].int_value() != 0) {
-		obs_log(LOG_ERROR, "停止直播失败: %s",
-			err.empty() ? json["message"].string_value().c_str() : err.c_str());
-		message = "停止直播失败: " + (err.empty() ? json["message"].string_value() : err);
+	json11::Json json;
+	if (!readApiReply(response, "停止直播", json, message)) {
 		return false;
 	}
 
@@ -560,10 +552,8 @@ bool BiliApi::updateRoomInfo(const Config &config, const std::string &title, std
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty() || json["code"].int_value() != 0) {
-		message = "更新直播间信息失败: " + (err.empty() ? json["message"].string_value() : err);
+	json11::Json json;
+	if (!readApiReply(response, "更新直播间信息", json, message)) {
 		return false;
 	}
 
@@ -590,10 +580,8 @@ bool BiliApi::updateRoomArea(const Config &config, int area_id, std::string &mes
 		return false;
 	}
 
-	std::string err;
-	json11::Json json = json11::Json::parse(response.data, err);
-	if (!err.empty() || json["code"].int_value() != 0) {
-		message = "更新直播间分区失败: " + (err.empty() ? json["message"].string_value() : err);
+	json11::Json json;
+	if (!readApiReply(response, "更新直播间分区", json, message)) {
 		return false;
 	}
 

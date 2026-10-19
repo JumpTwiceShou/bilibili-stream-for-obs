@@ -16,6 +16,9 @@ public:
 		QAction *streamToggle = nullptr;
 		QAction *openRoom = nullptr;
 		QAction *updateRoomInfo = nullptr;
+		QAction *proxySettings = nullptr;
+		QAction *syncSettings = nullptr;
+		QAction *streamRoutes = nullptr;
 	};
 
 	explicit MenuManager(QMenuBar *menuBar, QObject *parent = nullptr);
@@ -28,6 +31,9 @@ signals:
 	void streamToggleClicked();
 	void openRoomClicked();
 	void updateRoomInfoClicked();
+	void proxySettingsClicked();
+	void syncSettingsClicked();
+	void streamRoutesClicked();
 
 private:
 	void setupMenu();

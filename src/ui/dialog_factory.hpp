@@ -9,6 +9,17 @@
 #include "core/api_utils.hpp"
 
 namespace UI {
+struct RoomChanges {
+	std::string baseTitle, title;
+	int baseAreaId = 0, basePartId = 0, areaId = 0, partId = 0;
+};
+struct RoomApplyResult {
+	bool titleUpdated = false, areaUpdated = false;
+	std::string message;
+};
+using RoomApplyCallback = std::function<void(RoomApplyResult)>;
+using RoomApplyRequest = std::function<void(const RoomChanges &, RoomApplyCallback)>;
+
 class DialogFactory {
 public:
 	using QrPollCallback =
@@ -24,11 +35,10 @@ public:
 	static bool confirm(const QString &msg, const QString &title, QWidget *parent = nullptr);
 	static void qrLogin(QWidget *parent, const std::string &qrData, QrPollRequest requestPoll,
 			    std::function<void(const std::string &cookies)> onSuccess);
-	static void streamStarted(QWidget *parent, const std::string &rtmpAddr, const std::string &rtmpCode);
 	static bool faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
 			     FaceRetryRequest requestRetry);
 	static void roomSettings(QWidget *parent, const std::string &roomUrl, const std::string &currentTitle,
 				 int currentAreaId, int currentPartId, const json11::Json &partitionData,
-				 std::function<void(const std::string &title, int areaId, int partId)> onApply);
+				 RoomApplyRequest onApply);
 };
 } // namespace UI

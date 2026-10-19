@@ -1,6 +1,8 @@
 #include "core/api_utils.hpp"
 
 #include <charconv>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <string_view>
@@ -111,6 +113,70 @@ FaceAuthRetryDecision classifyFaceAuthRetry(bool started, bool faceAuthRequired)
 	return faceAuthRequired ? FaceAuthRetryDecision::ContinueWaiting : FaceAuthRetryDecision::Failed;
 }
 
+bool apiResponseCode(const json11::Json &response, int &code)
+{
+	return response.is_object() && jsonInteger(response["code"], code, std::numeric_limits<int>::min());
+}
+
+std::string apiErrorMessage(const json11::Json &response, const std::string &action)
+{
+	std::string detail;
+	for (const auto *field : {"message", "msg"}) {
+		const auto value = trim(response[field].string_value());
+		if (!value.empty()) {
+			detail = value;
+			break;
+		}
+	}
+	if (detail.size() > 512) {
+		size_t end = 512;
+		while (end > 0 && (static_cast<unsigned char>(detail[end]) & 0xc0) == 0x80)
+			--end;
+		detail.resize(end);
+		detail += "…";
+	}
+	if (detail.empty()) {
+		int code = 0;
+		detail = apiResponseCode(response, code) && code != 0 ? "错误码 " + std::to_string(code)
+								      : "响应字段无效";
+	}
+	return action + "失败: " + detail;
+}
+
+bool isIpFollowerRestriction(const std::string &message)
+{
+	std::string lower = message;
+	std::transform(lower.begin(), lower.end(), lower.begin(),
+		       [](unsigned char c) { return char(std::tolower(c)); });
+	bool ip = false;
+	for (size_t pos = lower.find("ip"); pos != std::string::npos; pos = lower.find("ip", pos + 2)) {
+		auto letter = [](char c) {
+			return c >= 'a' && c <= 'z';
+		};
+		if ((pos == 0 || !letter(lower[pos - 1])) && (pos + 2 == lower.size() || !letter(lower[pos + 2])))
+			ip = true;
+	}
+	return ip && (lower.find("粉丝") != std::string::npos || lower.find("follower") != std::string::npos);
+}
+
+bool faceAuthIdentified(const json11::Json &response, bool &identified)
+{
+	identified = false;
+	int code = -1;
+	if (!jsonInteger(response["code"], code) || code != 0)
+		return false;
+	const auto &value = response["data"]["is_identified"];
+	if (value.is_bool()) {
+		identified = value.bool_value();
+		return true;
+	}
+	int flag = -1;
+	if (!jsonInteger(value, flag) || flag > 1)
+		return false;
+	identified = flag == 1;
+	return true;
+}
+
 bool shouldStopManagedSession(bool managedSession, bool statusKnown, bool isLive)
 {
 	return managedSession && (!statusKnown || isLive);
@@ -118,6 +184,7 @@ bool shouldStopManagedSession(bool managedSession, bool statusKnown, bool isLive
 
 ControlState controlState(bool busy, bool loggedIn, bool hasRoomId, bool hasCredentials)
 {
-	return {!busy, !busy && hasCredentials, !busy && loggedIn, !busy && loggedIn, !busy && hasRoomId};
+	const bool roomReady = !busy && loggedIn && hasRoomId;
+	return {!busy, !busy && hasCredentials, roomReady, roomReady, roomReady};
 }
 } // namespace Core
