@@ -4,7 +4,9 @@
 
 本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
 
-## 1.3.0 更新
+## 1.3.0 已撤回
+
+1.3.0 因人脸验证完成状态无法可靠识别而撤回，暂停分发。目前公开下载版本为 [1.2.0](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.2.0)。已安装 1.3.0 的用户可在关闭 OBS 后替换为 1.2.0；1.2.0 也不保证解决本次人脸验证问题。以下为已撤回版本的变更记录。
 
 - 新增 OBS 开播、停播联动独立开关，支持滑动切换和自动保存。
 - 优化人脸识别等待状态，识别成功后自动继续开播，减少重复尝试和提示反复切换。
@@ -34,7 +36,7 @@
 
 ### Windows
 
-1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.3.0-windows-x64.zip`。
+1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.2.0-windows-x64.zip`。
 2. 解压压缩包。
 3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
 
