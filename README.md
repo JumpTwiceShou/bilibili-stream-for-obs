@@ -18,7 +18,7 @@
 
 ## 1.3.0 已撤回
 
-1.3.0 因人脸验证完成状态无法可靠识别而撤回，暂停分发。目前公开下载版本为 [1.2.0](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.2.0)。已安装 1.3.0 的用户可在关闭 OBS 后替换为 1.2.0；1.2.0 也不保证解决本次人脸验证问题。以下为已撤回版本的变更记录。
+1.3.0 因人脸验证完成状态无法可靠识别而撤回，暂停分发。当前请下载 [1.3.1](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.3.1)。以下为已撤回版本的变更记录。
 
 - 新增 OBS 开播、停播联动独立开关，支持滑动切换和自动保存。
 - 优化人脸识别等待状态，识别成功后自动继续开播，减少重复尝试和提示反复切换。
@@ -70,6 +70,8 @@
    ```
 
 5. 重启 OBS Studio，菜单栏中出现“Bilibili直播”即代表插件已加载。
+
+若官方安全验证窗口提示缺少 Microsoft Edge WebView2 Runtime，请从 [Microsoft 官方页面](https://developer.microsoft.com/microsoft-edge/webview2/)安装后重试。
 
 ## 使用方法
 

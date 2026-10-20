@@ -15,7 +15,7 @@ The first public release of this repository is `1.0.0`. The basic workflow follo
 
 ## 1.3.0 withdrawn
 
-Version 1.3.0 has been withdrawn because completion of face verification cannot be detected reliably. The current public download is [1.2.0](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.2.0). Users of 1.3.0 can close OBS and replace the plugin with 1.2.0; this does not guarantee a fix for the reported verification issue. The withdrawn version's changes are retained below.
+Version 1.3.0 has been withdrawn because completion of face verification cannot be detected reliably. The current public download is [1.3.1](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.3.1). The withdrawn version's changes are retained below.
 
 - Independent, automatically saved OBS start/stop synchronization switches.
 - Stable face-verification status with automatic continuation after success.
@@ -64,6 +64,8 @@ Version 1.3.0 has been withdrawn because completion of face verification cannot 
    ```
 
 5. Restart OBS Studio. The plugin is loaded when the `Bilibili直播` menu appears.
+
+If the official security-verification window reports a missing Microsoft Edge WebView2 Runtime, install it from the [Microsoft website](https://developer.microsoft.com/microsoft-edge/webview2/) and retry.
 
 ## Usage
 
