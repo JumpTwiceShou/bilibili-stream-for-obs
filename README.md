@@ -4,6 +4,18 @@
 
 本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
 
+## 1.3.1 更新
+
+- 新增 OBS 开播、停播联动独立开关，支持滑动切换和自动保存。
+- 优化人脸识别等待状态，识别成功后自动继续开播，减少重复尝试和提示反复切换。
+- 适配新版扫码登录；登录成功但未开通直播间或房间信息获取失败时，提供明确提示。
+- 切换账号或登录失效后清理旧账号的房间信息和推流凭据，保留同步开关等通用设置；同一账号重新登录保留线路偏好。
+- 直播间修改会等待接口结果，失败时保留输入，支持重试。
+- 新增推流线路连接延迟推荐、地址复制和一键替换 OBS 推流配置；升级时保留用户设置。
+- 启动日志增加版本和构建标识，方便定位不同测试包；清理旧版推流信息窗口。
+- 改进网络请求取消与退出稳定性。
+- 对于某些情况下禁止 OBS 开播的问题，给出了一个神秘解决方法。
+
 ## 1.3.0 已撤回
 
 1.3.0 因人脸验证完成状态无法可靠识别而撤回，暂停分发。目前公开下载版本为 [1.2.0](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/tag/1.2.0)。已安装 1.3.0 的用户可在关闭 OBS 后替换为 1.2.0；1.2.0 也不保证解决本次人脸验证问题。以下为已撤回版本的变更记录。
@@ -36,7 +48,7 @@
 
 ### Windows
 
-1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.2.0-windows-x64.zip`。
+1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.3.1-windows-x64.zip`。
 2. 解压压缩包。
 3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
 

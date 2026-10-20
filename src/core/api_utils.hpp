@@ -7,6 +7,9 @@
 #include "json11/json11.hpp"
 
 namespace Core {
+inline constexpr const char *browserUserAgent =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+
 struct ControlState {
 	bool scanQrEnabled = false;
 	bool logoutEnabled = false;
@@ -15,7 +18,7 @@ struct ControlState {
 	bool openRoomEnabled = false;
 };
 
-enum class FaceAuthRetryDecision { Started, ContinueWaiting, Failed };
+enum class FaceAuthRetryDecision { Started, ContinueWaiting, ChallengeChanged, Failed };
 
 std::string extractCookieValue(const std::string &cookies, const std::string &key);
 std::string encodeFormComponent(const std::string &value);

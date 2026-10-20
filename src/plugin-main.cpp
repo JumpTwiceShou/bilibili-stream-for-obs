@@ -35,6 +35,7 @@
 #include "http_client.hpp"
 #include "plugin_utils.hpp"
 #include "ui/dialog_factory.hpp"
+#include "ui/risk_auth_dialog.hpp"
 #include "ui/locale.hpp"
 #include "ui/menu_manager.hpp"
 #include "ui/proxy_dialog.hpp"
@@ -80,17 +81,19 @@ struct StartAttempt {
 	std::string rtmpAddress;
 	std::string rtmpCode;
 	std::string faceUrl;
+	std::string riskVoucher;
 	int faceAuthCode = 0;
 	std::string message;
 };
 
-StartAttempt startLive(Bili::Config config)
+StartAttempt startLive(Bili::Config config, const std::string &gaiaToken = {})
 {
 	StartAttempt result;
 	result.config = std::move(config);
 	std::string mid = result.config.mid;
 	result.started = Bili::BiliApi::startLive(result.config, result.rtmpAddress, result.rtmpCode, result.message,
-						  result.faceUrl, result.faceAuthCode, mid);
+						  result.faceUrl, result.faceAuthCode, mid, &result.riskVoucher,
+						  gaiaToken);
 	result.config.mid = mid;
 	return result;
 }
@@ -253,6 +256,7 @@ private:
 	void openLiveRoom();
 	void handleStartAttempt(StartAttempt result);
 	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode);
+	void handleRiskAuthRequired(const StartAttempt &attempt);
 	void applyRoomChanges(const UI::RoomChanges &changes, UI::RoomApplyCallback callback);
 
 	Core::ConfigManager m_config;
@@ -900,6 +904,10 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 		onStreamRoutes();
 		return;
 	}
+	if (!result.riskVoucher.empty()) {
+		handleRiskAuthRequired(result);
+		return;
+	}
 	if (!result.faceUrl.empty() && result.faceAuthCode != 0) {
 		handleFaceAuthRequired(result.config, result.faceUrl, result.faceAuthCode);
 		return;
@@ -913,6 +921,40 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 	UI::DialogFactory::message(QString::fromUtf8(result.message) + help, UI::text("Dialog.StartFailed"));
 }
 
+void BilibiliStreamPlugin::handleRiskAuthRequired(const StartAttempt &attempt)
+{
+	QString error;
+	const QString token = UI::officialRiskAuth(static_cast<QWidget *>(obs_frontend_get_main_window()),
+						   attempt.config.cookies, attempt.riskVoucher,
+						   m_proxySettings.apiEnabled(), m_proxy->endpoint(), error);
+	if (token.isEmpty()) {
+		m_startObsAfterPrepare = false;
+		setControlsBusy(false);
+		if (!error.isEmpty())
+			UI::DialogFactory::message(error, UI::text("Dialog.StartFailed"));
+		return;
+	}
+	const auto alive = m_alive;
+	const auto config = attempt.config;
+	obs_log(LOG_INFO, "Official risk verification completed; retrying start-live once");
+	if (!enqueue([this, alive, config, token = token.toStdString()] {
+		    StartAttempt result = startLive(config, token);
+		    // Never loop on a consumed risk challenge. Completion still needs startLive success.
+		    if (!result.riskVoucher.empty()) {
+			    result.riskVoucher.clear();
+			    result.faceAuthCode = 0;
+			    result.message =
+				    "官方安全验证已返回，但 B 站开播仍要求验证，请稍后重新尝试；未启动 OBS 推流。";
+		    }
+		    postToUi(alive,
+			     [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
+	    })) {
+		m_startObsAfterPrepare = false;
+		setControlsBusy(false);
+		UI::DialogFactory::message(QStringLiteral("后台请求队列不可用"), UI::text("Dialog.StartFailed"));
+	}
+}
+
 void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl,
 						  int faceAuthCode)
 {
@@ -922,6 +964,7 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 		int faceAuthCode = 0;
 		StartAttempt completedAttempt;
 		bool hasCompletedAttempt = false;
+		int lastPollState = -1;
 	};
 	auto session = std::make_shared<FaceAuthSession>();
 	session->config = config;
@@ -937,13 +980,23 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 			const Bili::Config pollConfig = session->config;
 			const int pollAuthCode = session->faceAuthCode;
 			auto failureCallback = callback;
-			if (!enqueue([alive, pollConfig, pollAuthCode, callback = std::move(callback)]() mutable {
+			if (!enqueue([alive, session, pollConfig, pollAuthCode,
+				      callback = std::move(callback)]() mutable {
 				    bool identified = false;
 				    std::string statusMessage;
 				    const bool requestSucceeded = Bili::BiliApi::isUserIdentifiedByFaceAuth(
 					    pollConfig, pollAuthCode, identified, statusMessage);
-				    postToUi(alive, [callback = std::move(callback), requestSucceeded, identified,
+				    postToUi(alive, [session, pollAuthCode, callback = std::move(callback),
+						     requestSucceeded, identified,
 						     statusMessage = std::move(statusMessage)]() mutable {
+					    const int pollState = requestSucceeded ? (identified ? 2 : 1) : 0;
+					    if (session->lastPollState != pollState) {
+						    session->lastPollState = pollState;
+						    obs_log(LOG_INFO, "Room face verification: type=%d, state=%s",
+							    pollAuthCode,
+							    requestSucceeded ? (identified ? "verified" : "pending")
+									     : "unavailable");
+					    }
 					    callback(requestSucceeded, identified, std::move(statusMessage));
 				    });
 			    })) {
@@ -967,6 +1020,12 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 						    session->faceUrl = result.faceUrl;
 						    session->faceAuthCode = result.faceAuthCode;
 						    callback(decision, result.faceUrl, {});
+						    return;
+					    }
+					    if (!result.riskVoucher.empty()) {
+						    session->completedAttempt = std::move(result);
+						    session->hasCompletedAttempt = true;
+						    callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {});
 						    return;
 					    }
 					    unlockProxyForError(result.message);

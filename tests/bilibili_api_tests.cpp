@@ -11,6 +11,7 @@ namespace {
 int failures = 0;
 struct Request {
 	std::string method, url, body;
+	std::vector<std::string> headers;
 };
 std::deque<Http::HttpResponse> replies;
 std::vector<Request> requests;
@@ -54,17 +55,22 @@ bool HttpClient::init()
 	return true;
 }
 void HttpClient::cleanup() {}
-HttpResponse HttpClient::get(const std::string &url, const std::vector<std::string> &, long)
+HttpResponse HttpClient::get(const std::string &url, const std::vector<std::string> &headers, long)
 {
-	return take("GET", url);
+	auto response = take("GET", url);
+	requests.back().headers = headers;
+	return response;
 }
 HttpResponse HttpClient::getLoginTicket(const std::string &url, const std::vector<std::string> &, long)
 {
 	return take("TICKET", url);
 }
-HttpResponse HttpClient::post(const std::string &url, const std::string &body, const std::vector<std::string> &, long)
+HttpResponse HttpClient::post(const std::string &url, const std::string &body, const std::vector<std::string> &headers,
+			      long)
 {
-	return take("POST", url, body);
+	auto response = take("POST", url, body);
+	requests.back().headers = headers;
+	return response;
 }
 } // namespace Http
 
@@ -135,6 +141,37 @@ int main(int argc, char **argv)
 	reset({version, reply(R"({"code":60024,"data":{"qr":"https://www.bilibili.com/face"}})")});
 	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !face.empty() && faceCode == 60024,
 	      "face-required responses still produce face verification");
+	reset({version, reply(R"({"code":60028,"data":{"qr":"https://www.bilibili.com/new-anchor-face"}})")});
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !face.empty() && faceCode == 60028,
+	      "new-anchor room verification follows the official 60028 flow");
+	std::string voucher = "stale";
+	reset({version, reply(R"({"code":60043,"data":{"risk_extra":{"v_voucher":"fixture-voucher"}}})")});
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid, &voucher) && face.empty() &&
+		      faceCode == 60043 && voucher == "fixture-voucher",
+	      "60043 forwards the actual challenge voucher and never fabricates an unrelated face QR");
+	reset({version, reply(R"({"code":60043,"data":{}})")});
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid, &voucher) && face.empty() &&
+		      faceCode == 0 && voucher.empty(),
+	      "missing risk voucher fails without a fake challenge");
+	bool identified = true;
+	reset({});
+	check(!Api::isUserIdentifiedByFaceAuth(config, 60043, identified, message) && !identified && requests.empty(),
+	      "risk challenges cannot query the unrelated room-face endpoint");
+	for (const auto code : {60024, 60028}) {
+		reset({reply(R"({"code":0,"data":{"is_identified":true}})")});
+		check(Api::isUserIdentifiedByFaceAuth(config, code, identified, message) && identified &&
+			      requests.back().body.find("face_auth_code=" + std::to_string(code)) != std::string::npos,
+		      "room-face status uses the original official challenge type");
+	}
+	const auto originalCookies = config.cookies;
+	reset({version, reply(R"({"code":0,"data":{"rtmp":{"addr":"rtmp://fixture/live","code":"fixture-key"}}})")});
+	check(Api::startLive(config, address, key, message, face, faceCode, mid, &voucher, "verified-token") &&
+		      config.cookies == originalCookies && voucher.empty(),
+	      "validated token is used for one attempt without persisting it");
+	bool sentToken = false;
+	for (const auto &header : requests.back().headers)
+		sentToken |= header.find("x-bili-gaia-vtoken=verified-token") != std::string::npos;
+	check(sentToken, "official SDK completion token reaches the retry cookie");
 	for (const auto *bad : {R"({"code":-500})", R"({"code":-500,"message":" ","msg":"稍后重试"})",
 				R"({"data":{"rtmp":{"addr":"bad","code":"bad"}}})", R"({"code":0})", "invalid"}) {
 		reset({version, reply(bad)});

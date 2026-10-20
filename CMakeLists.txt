@@ -50,6 +50,7 @@ add_library(
   src/ui/dialog_factory.cpp
   src/ui/proxy_dialog.cpp
   src/ui/stream_routes_dialog.cpp
+  src/ui/risk_auth_dialog.cpp
   src/proxy/api_request_gate.cpp
   src/proxy/proxy_settings.cpp
   src/proxy/openvpn_profile.cpp
@@ -124,6 +125,7 @@ target_link_libraries(
 )
 if(WIN32)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE crypt32)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/webview2.cmake")
 endif()
 
 target_compile_options(
@@ -174,6 +176,14 @@ if(BUILD_TESTING)
   add_test(NAME plugin-http-lifecycle-tests COMMAND plugin-http-lifecycle-tests)
   set_tests_properties(plugin-http-lifecycle-tests PROPERTIES TIMEOUT 20)
   if(WIN32)
+    add_executable(plugin-risk-ui-tests tests/risk_ui_tests.cpp src/ui/risk_auth_dialog.cpp
+      src/core/api_utils.cpp src/json11/json11.cpp)
+    target_include_directories(plugin-risk-ui-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_definitions(plugin-risk-ui-tests PRIVATE BILIBILI_RISK_AUTH_TEST=1)
+    target_link_libraries(plugin-risk-ui-tests PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
+    target_link_webview2(plugin-risk-ui-tests)
+    # Requires a real Windows desktop/WebView2 runtime, not Qt's minimal test platform.
+    # Run manually; --official-sdk exercises real SDK loading with an invalid fixture voucher.
     add_executable(plugin-proxy-tests tests/proxy_tests.cpp src/proxy/proxy_settings.cpp src/proxy/openvpn_profile.cpp src/core/secret_store.cpp)
     target_include_directories(plugin-proxy-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(plugin-proxy-tests PRIVATE Qt6::Core crypt32)

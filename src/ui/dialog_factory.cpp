@@ -189,13 +189,13 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	struct PollState {
 		bool inFlight = false;
 		bool positiveConsumed = false;
-		int positiveCount = 0;
 		QElapsedTimer elapsed;
 	};
 	auto state = std::make_shared<PollState>();
 	state->elapsed.start();
 	QTimer timer(&dialog);
-	timer.setInterval(5000);
+	// Matches the official room-verification component; one explicit success is sufficient.
+	timer.setInterval(1500);
 	QPointer<QDialog> guard(&dialog);
 	const auto retry = [guard, state, &timer, qrLabel, statusLabel, detail, retryButton, requestRetry]() {
 		if (!guard || state->inFlight)
@@ -223,7 +223,8 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 				return;
 			}
 			timer.stop();
-			if (decision == Core::FaceAuthRetryDecision::Started)
+			if (decision == Core::FaceAuthRetryDecision::Started ||
+			    decision == Core::FaceAuthRetryDecision::ChallengeChanged)
 				guard->accept();
 			else {
 				statusLabel->setText(text("Dialog.StartFailed"));
@@ -247,17 +248,15 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 				return;
 			state->inFlight = false;
 			if (!succeeded) {
-				state->positiveCount = 0;
 				detail->setText(text("Face.StatusUnavailable"));
 				return;
 			}
 			if (!identified) {
 				state->positiveConsumed = false;
-				state->positiveCount = 0;
 				detail->clear();
 				return;
 			}
-			if (!state->positiveConsumed && ++state->positiveCount >= 2)
+			if (!state->positiveConsumed)
 				retry();
 		});
 	};

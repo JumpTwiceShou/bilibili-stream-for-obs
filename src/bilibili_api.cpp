@@ -23,7 +23,7 @@ static const std::vector<std::string> default_headers = {
 	"Sec-Fetch-Dest: empty",
 	"Sec-Fetch-Mode: cors",
 	"Sec-Fetch-Site: same-site",
-	"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"};
+	std::string("User-Agent: ") + Core::browserUserAgent};
 
 bool requireSuccessfulResponse(const Http::HttpResponse &response, const char *action, std::string &message)
 {
@@ -390,8 +390,12 @@ json11::Json BiliApi::getPartitionList(std::string &message)
 }
 
 bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
-			std::string &face_qr, int &face_auth_code, std::string &mid)
+			std::string &face_qr, int &face_auth_code, std::string &mid, std::string *risk_voucher,
+			const std::string &gaia_token)
 {
+	(void)mid;
+	if (risk_voucher)
+		risk_voucher->clear();
 	face_qr.clear();
 	face_auth_code = 0;
 	rtmp_addr.clear();
@@ -409,7 +413,10 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 		"https://api.live.bilibili.com/xlive/app-blink/v1/liveVersionInfo/getHomePageLiveVersion?" +
 		version_query;
 
-	auto headers = buildHeaders(config.cookies);
+	// The official SDK's short-lived token applies only to this attempt, never saved login state.
+	auto headers = buildHeaders(
+		config.cookies +
+		(gaia_token.empty() ? "" : "; x-bili-gaia-vtoken=" + Core::encodeFormComponent(gaia_token)));
 	auto version_response = Http::HttpClient::get(version_url, headers);
 	if (!requireSuccessfulResponse(version_response, "获取直播版本信息", message)) {
 		return false;
@@ -455,22 +462,26 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 		if (Core::isIpFollowerRestriction(message))
 			return false;
 
-		if (code == 60024) {
+		if (code == 60024 || code == 60028) {
 			std::string face_url = json["data"]["qr"].string_value();
-			obs_log(LOG_WARNING, "Start-live requires face authentication (code 60024)");
+			obs_log(LOG_WARNING, "Start-live requires room face authentication (code %d)", code);
 			message = "需要人脸验证，请扫描二维码";
 			face_qr = face_url;
 			face_auth_code = code;
 			return false;
 		}
 		if (code == 60043) {
-			std::string face_url =
-				"https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=" +
-				Core::encodeFormComponent(mid);
-			obs_log(LOG_WARNING, "Start-live requires face authentication (code 60043)");
-			message = "需要人脸验证，请扫描二维码";
-			face_qr = face_url;
-			face_auth_code = code;
+			// Current official live center delegates 60043 to CaptchaLoader with this voucher.
+			// A generic face-auth-middle URL cannot complete this particular risk challenge.
+			const auto voucher = json["data"]["risk_extra"]["v_voucher"].string_value();
+			obs_log(LOG_WARNING, "Start-live requires official risk verification (code 60043)");
+			if (risk_voucher && !voucher.empty()) {
+				*risk_voucher = voucher;
+				face_auth_code = code;
+				message = "需要完成本次官方安全验证";
+			} else {
+				message = "B 站要求官方安全验证，但缺少本次验证凭证，请重新尝试开播";
+			}
 			return false;
 		}
 		return false;
@@ -489,7 +500,8 @@ bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_cod
 					 std::string &message)
 {
 	is_identified = false;
-	if (config.room_id.empty() || config.csrf_token.empty() || face_auth_code <= 0) {
+	if (config.room_id.empty() || config.csrf_token.empty() ||
+	    (face_auth_code != 60024 && face_auth_code != 60028)) {
 		message = "查询人脸认证状态失败: 配置或认证类型无效";
 		return false;
 	}

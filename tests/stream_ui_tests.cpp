@@ -98,7 +98,7 @@ int main(int argc, char **argv)
 		nullptr, "https://fixture.example/face",
 		[&](auto callback) {
 			++polls;
-			callback(true, polls != 3, {});
+			callback(true, polls != 2, {});
 		},
 		[&](auto callback) {
 			++retries;
@@ -106,7 +106,25 @@ int main(int argc, char **argv)
 					      : Core::FaceAuthRetryDecision::Started,
 				 {}, {});
 		});
-	check(completed && retries == 2 && polls == 5, "new pending-to-success transition automatically resumes start");
+	check(completed && retries == 2 && polls == 3,
+	      "a single success immediately retries; pending rearms a stale result");
+	polls = retries = 0;
+	const bool firstPositive = UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face",
+		[&](auto callback) {
+			++polls;
+			callback(true, true, {});
+		},
+		[&](auto callback) {
+			++retries;
+			callback(Core::FaceAuthRetryDecision::Started, {}, {});
+		});
+	check(firstPositive && polls == 1 && retries == 1,
+	      "first explicit positive starts without waiting for a second poll");
+	const bool changed = UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face", [](auto callback) { callback(true, true, {}); },
+		[](auto callback) { callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {}); });
+	check(changed, "changed challenge hands off to the official risk flow instead of polling the wrong endpoint");
 	UI::DialogFactory::FacePollCallback late;
 	speedUp();
 	UI::DialogFactory::faceAuth(
