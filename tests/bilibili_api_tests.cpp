@@ -144,34 +144,41 @@ int main(int argc, char **argv)
 	reset({version, reply(R"({"code":60028,"data":{"qr":"https://www.bilibili.com/new-anchor-face"}})")});
 	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !face.empty() && faceCode == 60028,
 	      "new-anchor room verification follows the official 60028 flow");
-	std::string voucher = "stale";
 	reset({version, reply(R"({"code":60043,"data":{"risk_extra":{"v_voucher":"fixture-voucher"}}})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid, &voucher) && face.empty() &&
-		      faceCode == 60043 && voucher == "fixture-voucher",
-	      "60043 forwards the actual challenge voucher and never fabricates an unrelated face QR");
+	const std::string legacyFaceUrl =
+		"https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=42";
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && face == legacyFaceUrl &&
+		      faceCode == 60043 && address.empty() && key.empty(),
+	      "60043 restores the native QR path even when the response includes an SDK voucher");
 	reset({version, reply(R"({"code":60043,"data":{}})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid, &voucher) && face.empty() &&
-		      faceCode == 0 && voucher.empty(),
-	      "missing risk voucher fails without a fake challenge");
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && face == legacyFaceUrl &&
+		      faceCode == 60043,
+	      "native QR display does not depend on an SDK voucher");
+	mid = "42&source_event=other";
+	reset({version, reply(R"({"code":60043})")});
+	check(!Api::startLive(config, address, key, message, face, faceCode, mid) &&
+		      face == legacyFaceUrl + "%26source_event%3Dother",
+	      "native QR account parameter remains URL encoded");
+	mid = "42";
 	bool identified = true;
 	reset({});
-	check(!Api::isUserIdentifiedByFaceAuth(config, 60043, identified, message) && !identified && requests.empty(),
-	      "risk challenges cannot query the unrelated room-face endpoint");
-	for (const auto code : {60024, 60028}) {
+	check(!Api::isUserIdentifiedByFaceAuth(config, 12345, identified, message) && !identified && requests.empty(),
+	      "unknown challenge types cannot issue a face-status request");
+	for (const auto code : {60024, 60028, 60043}) {
 		reset({reply(R"({"code":0,"data":{"is_identified":true}})")});
 		check(Api::isUserIdentifiedByFaceAuth(config, code, identified, message) && identified &&
 			      requests.back().body.find("face_auth_code=" + std::to_string(code)) != std::string::npos,
-		      "room-face status uses the original official challenge type");
+		      "native face-status polling preserves the original challenge type");
 	}
 	const auto originalCookies = config.cookies;
 	reset({version, reply(R"({"code":0,"data":{"rtmp":{"addr":"rtmp://fixture/live","code":"fixture-key"}}})")});
-	check(Api::startLive(config, address, key, message, face, faceCode, mid, &voucher, "verified-token") &&
-		      config.cookies == originalCookies && voucher.empty(),
-	      "validated token is used for one attempt without persisting it");
+	check(Api::startLive(config, address, key, message, face, faceCode, mid) &&
+		      config.cookies == originalCookies && face.empty() && faceCode == 0,
+	      "confirmed start clears the prior QR challenge and retains account cookies");
 	bool sentToken = false;
 	for (const auto &header : requests.back().headers)
-		sentToken |= header.find("x-bili-gaia-vtoken=verified-token") != std::string::npos;
-	check(sentToken, "official SDK completion token reaches the retry cookie");
+		sentToken |= header.find("x-bili-gaia-vtoken=") != std::string::npos;
+	check(!sentToken, "start requests no longer inject a browser SDK completion token");
 	for (const auto *bad : {R"({"code":-500})", R"({"code":-500,"message":" ","msg":"稍后重试"})",
 				R"({"data":{"rtmp":{"addr":"bad","code":"bad"}}})", R"({"code":0})", "invalid"}) {
 		reset({version, reply(bad)});

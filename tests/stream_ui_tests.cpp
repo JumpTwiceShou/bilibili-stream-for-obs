@@ -121,10 +121,29 @@ int main(int argc, char **argv)
 		});
 	check(firstPositive && polls == 1 && retries == 1,
 	      "first explicit positive starts without waiting for a second poll");
-	const bool changed = UI::DialogFactory::faceAuth(
-		nullptr, "https://fixture.example/face", [](auto callback) { callback(true, true, {}); },
-		[](auto callback) { callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {}); });
-	check(changed, "changed challenge hands off to the official risk flow instead of polling the wrong endpoint");
+	QDialog *originalFaceDialog = nullptr;
+	int changedPolls = 0, changedRetries = 0;
+	speedUp();
+	const bool refreshed = UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face",
+		[&](auto callback) {
+			auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			if (!originalFaceDialog)
+				originalFaceDialog = dialog;
+			check(dialog == originalFaceDialog, "a replacement QR keeps the same native dialog");
+			bool hasQr = false;
+			for (auto *label : dialog->findChildren<QLabel *>())
+				hasQr |= !label->pixmap().isNull();
+			check(hasQr, "native face dialog renders a QR without an embedded browser");
+			callback(true, ++changedPolls != 2, {});
+		},
+		[&](auto callback) {
+			callback(++changedRetries == 1 ? Core::FaceAuthRetryDecision::ContinueWaiting
+						     : Core::FaceAuthRetryDecision::Started,
+				 "https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=42",
+				 {});
+		});
+	check(refreshed && changedRetries == 2, "replacement QR waits for confirmed start in the same dialog");
 	UI::DialogFactory::FacePollCallback late;
 	speedUp();
 	UI::DialogFactory::faceAuth(
@@ -157,6 +176,91 @@ int main(int argc, char **argv)
 				       ++applied;
 				       return address == routes[1].url;
 			       });
+	int obsStarts = 0;
+	UI::StreamRouteActions actions;
+	actions.obsActive = [] {
+		return false;
+	};
+	actions.startObs = [&](const QString &address, QString &) {
+		++obsStarts;
+		return address == routes[1].url;
+	};
+	QTimer::singleShot(20, &app, [&] {
+		auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+		check(dialog->windowTitle().contains(QStringLiteral("B 站开播成功")),
+		      "route title confirms Bilibili start success");
+		auto *banner = dialog->findChild<QLabel *>("streamSessionStatus");
+		check(banner && banner->text().contains(QStringLiteral("OBS 尚未开始推流")),
+		      "banner distinguishes Bilibili from OBS output");
+		for (const auto &argument : app.arguments())
+			if (argument.startsWith("--capture-route-dialog="))
+				check(dialog->grab().save(argument.mid(QString("--capture-route-dialog=").size())),
+				      "capture route dialog");
+		check(!dialog->findChild<QCheckBox *>("autoStartObsSwitch") && obsStarts == 0,
+		      "route window does not add an automatic-output switch or start output on open");
+		auto *start = dialog->findChild<QPushButton *>("startObsStream");
+		check(start && start->text() == QStringLiteral("一键推流") && start->isEnabled() &&
+			      !start->autoDefault(),
+		      "explicit OBS start is available without becoming an Enter default");
+		start->click();
+		start->click();
+	});
+	UI::streamRoutesDialog(
+		nullptr, routes, 1, "fixture-stream-key", false, true, [](const QString &, QString &) { return true; },
+		actions);
+	check(obsStarts == 1, "direct OBS start applies selected route once and closes the route dialog");
+	QTimer::singleShot(20, &app, [&] {
+		auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+		check(!dialog->findChild<QPushButton *>("startObsStream")->isEnabled(),
+		      "historical routes cannot start an unconfirmed session");
+		dialog->reject();
+	});
+	UI::streamRoutesDialog(
+		nullptr, routes, 1, "old-key", false, false, [](const QString &, QString &) { return true; }, actions);
+	check(obsStarts == 1, "closing historical route dialog never starts OBS");
+	actions.startObs = [&](const QString &, QString &error) {
+		error = "fixture start rejected";
+		return false;
+	};
+	QTimer::singleShot(20, &app, [&] {
+		auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+		dialog->findChild<QPushButton *>("startObsStream")->click();
+		check(dialog->isVisible() &&
+			      dialog->findChild<QLabel *>("streamRouteStatus")->text() == "fixture start rejected",
+		      "rejected OBS start stays open and displays its failure");
+		dialog->reject();
+	});
+	UI::streamRoutesDialog(
+		nullptr, routes, 1, "fixture-stream-key", false, true, [](const QString &, QString &) { return true; },
+		actions);
+	bool sessionActive = true;
+	actions.sessionActive = [&] {
+		return sessionActive;
+	};
+	QTimer::singleShot(20, &app, [&] { sessionActive = false; });
+	QTimer::singleShot(350, &app, [&] {
+		auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+		check(!dialog->findChild<QPushButton *>("startObsStream")->isEnabled() &&
+			      !dialog->windowTitle().contains(QStringLiteral("开播成功")),
+		      "ended session loses success state and cannot start output");
+		dialog->reject();
+	});
+	UI::streamRoutesDialog(
+		nullptr, routes, 1, "fixture-stream-key", false, true, [](const QString &, QString &) { return true; },
+		actions);
+	sessionActive = true;
+	actions.obsActive = [] {
+		return true;
+	};
+	QTimer::singleShot(20, &app, [&] {
+		auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+		check(!dialog->findChild<QPushButton *>("startObsStream")->isEnabled(),
+		      "active OBS output cannot be started again");
+		dialog->reject();
+	});
+	UI::streamRoutesDialog(
+		nullptr, routes, 1, "fixture-stream-key", false, true, [](const QString &, QString &) { return true; },
+		actions);
 	int roomRequests = 0;
 	UI::RoomApplyCallback lateRoom;
 	const json11::Json partitions = json11::Json::array{json11::Json::object{

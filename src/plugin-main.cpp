@@ -35,7 +35,6 @@
 #include "http_client.hpp"
 #include "plugin_utils.hpp"
 #include "ui/dialog_factory.hpp"
-#include "ui/risk_auth_dialog.hpp"
 #include "ui/locale.hpp"
 #include "ui/menu_manager.hpp"
 #include "ui/proxy_dialog.hpp"
@@ -81,19 +80,17 @@ struct StartAttempt {
 	std::string rtmpAddress;
 	std::string rtmpCode;
 	std::string faceUrl;
-	std::string riskVoucher;
 	int faceAuthCode = 0;
 	std::string message;
 };
 
-StartAttempt startLive(Bili::Config config, const std::string &gaiaToken = {})
+StartAttempt startLive(Bili::Config config)
 {
 	StartAttempt result;
 	result.config = std::move(config);
 	std::string mid = result.config.mid;
 	result.started = Bili::BiliApi::startLive(result.config, result.rtmpAddress, result.rtmpCode, result.message,
-						  result.faceUrl, result.faceAuthCode, mid, &result.riskVoucher,
-						  gaiaToken);
+						  result.faceUrl, result.faceAuthCode, mid);
 	result.config.mid = mid;
 	return result;
 }
@@ -231,6 +228,7 @@ private slots:
 	void onProxySettings();
 	void onSyncSettings();
 	void onStreamRoutes();
+	bool startPreparedObs(const QString &address, QString &error);
 
 private:
 	static void frontendEventCallback(enum obs_frontend_event event, void *privateData);
@@ -256,7 +254,6 @@ private:
 	void openLiveRoom();
 	void handleStartAttempt(StartAttempt result);
 	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode);
-	void handleRiskAuthRequired(const StartAttempt &attempt);
 	void applyRoomChanges(const UI::RoomChanges &changes, UI::RoomApplyCallback callback);
 
 	Core::ConfigManager m_config;
@@ -784,6 +781,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 					   UI::text("Dialog.StartFailed"));
 		return;
 	}
+	m_startObsAfterPrepare = false;
 	setControlsBusy(true);
 	const Bili::Config config = m_config.config();
 	const auto alive = m_alive;
@@ -791,6 +789,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 		    ToggleResult result = toggleLive(config);
 		    postToUi(alive, [this, result = std::move(result)]() mutable {
 			    if (!result.liveStatusKnown) {
+				    m_startObsAfterPrepare = false;
 				    setControlsBusy(false);
 				    UI::DialogFactory::message(QString::fromUtf8(result.message),
 							       UI::text("Dialog.OperationFailed"));
@@ -798,6 +797,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 			    }
 			    setLiveState(result.wasLive);
 			    if (result.wasLive) {
+				    m_startObsAfterPrepare = false;
 				    setControlsBusy(false);
 				    if (result.stopped) {
 					    if (!obs_frontend_streaming_active()) {
@@ -818,6 +818,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 			    handleStartAttempt(std::move(result.start));
 		    });
 	    })) {
+		m_startObsAfterPrepare = false;
 		setControlsBusy(false);
 	}
 }
@@ -904,10 +905,6 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 		onStreamRoutes();
 		return;
 	}
-	if (!result.riskVoucher.empty()) {
-		handleRiskAuthRequired(result);
-		return;
-	}
 	if (!result.faceUrl.empty() && result.faceAuthCode != 0) {
 		handleFaceAuthRequired(result.config, result.faceUrl, result.faceAuthCode);
 		return;
@@ -919,40 +916,6 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 				     ? QStringLiteral("\n可从 Bilibili 菜单的“代理设置”配置接口连接。")
 				     : QString();
 	UI::DialogFactory::message(QString::fromUtf8(result.message) + help, UI::text("Dialog.StartFailed"));
-}
-
-void BilibiliStreamPlugin::handleRiskAuthRequired(const StartAttempt &attempt)
-{
-	QString error;
-	const QString token = UI::officialRiskAuth(static_cast<QWidget *>(obs_frontend_get_main_window()),
-						   attempt.config.cookies, attempt.riskVoucher,
-						   m_proxySettings.apiEnabled(), m_proxy->endpoint(), error);
-	if (token.isEmpty()) {
-		m_startObsAfterPrepare = false;
-		setControlsBusy(false);
-		if (!error.isEmpty())
-			UI::DialogFactory::message(error, UI::text("Dialog.StartFailed"));
-		return;
-	}
-	const auto alive = m_alive;
-	const auto config = attempt.config;
-	obs_log(LOG_INFO, "Official risk verification completed; retrying start-live once");
-	if (!enqueue([this, alive, config, token = token.toStdString()] {
-		    StartAttempt result = startLive(config, token);
-		    // Never loop on a consumed risk challenge. Completion still needs startLive success.
-		    if (!result.riskVoucher.empty()) {
-			    result.riskVoucher.clear();
-			    result.faceAuthCode = 0;
-			    result.message =
-				    "官方安全验证已返回，但 B 站开播仍要求验证，请稍后重新尝试；未启动 OBS 推流。";
-		    }
-		    postToUi(alive,
-			     [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
-	    })) {
-		m_startObsAfterPrepare = false;
-		setControlsBusy(false);
-		UI::DialogFactory::message(QStringLiteral("后台请求队列不可用"), UI::text("Dialog.StartFailed"));
-	}
 }
 
 void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl,
@@ -1020,12 +983,6 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 						    session->faceUrl = result.faceUrl;
 						    session->faceAuthCode = result.faceAuthCode;
 						    callback(decision, result.faceUrl, {});
-						    return;
-					    }
-					    if (!result.riskVoucher.empty()) {
-						    session->completedAttempt = std::move(result);
-						    session->hasCompletedAttempt = true;
-						    callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {});
 						    return;
 					    }
 					    unlockProxyForError(result.message);
@@ -1183,6 +1140,47 @@ void BilibiliStreamPlugin::unlockProxyForError(const std::string &message)
 	updateProxyVisibility();
 }
 
+bool BilibiliStreamPlugin::startPreparedObs(const QString &address, QString &error)
+{
+	if (m_operationInFlight || m_stopSyncInFlight || m_shuttingDown || obs_frontend_streaming_active()) {
+		error = QStringLiteral("请等待当前操作完成，或先停止正在进行的 OBS 推流。");
+		return false;
+	}
+	const auto &config = m_config.config();
+	if (!config.login_status || !config.managed_session || config.last_rtmp_key.empty()) {
+		error = QStringLiteral("本次 B 站直播已结束或推流信息不可用，请重新通过插件开播。");
+		return false;
+	}
+	const QUrl url(address, QUrl::StrictMode);
+	if (!url.isValid() || url.host().isEmpty() || !url.userInfo().isEmpty() ||
+	    (url.scheme() != "rtmp" && url.scheme() != "rtmps")) {
+		error = QStringLiteral("请选择有效的推流线路。");
+		return false;
+	}
+	if (m_proxySettings.streamEnabled()) {
+		if (!m_proxy->endpoint().ready()) {
+			error = UI::text("Sync.ProxyUnavailable");
+			return false;
+		}
+		m_directService.restore();
+		m_proxyTarget = address.toStdString();
+		m_proxyKey = config.last_rtmp_key;
+		if (!prepareProxyStream(error))
+			return false;
+	} else {
+		m_proxyService.restore();
+		if (!m_directService.install(address.toStdString(), config.last_rtmp_key)) {
+			error = UI::text("Sync.PrepareFailed");
+			return false;
+		}
+	}
+	m_config.config().selected_rtmp_address = address.toStdString();
+	saveConfig(false);
+	// Use the existing Bilibili session, without another startLive request.
+	obs_frontend_streaming_start();
+	return true;
+}
+
 void BilibiliStreamPlugin::onStreamRoutes()
 {
 	if (m_operationInFlight || m_stopSyncInFlight)
@@ -1211,6 +1209,20 @@ void BilibiliStreamPlugin::onStreamRoutes()
 	m_routesFresh = false;
 	const int selected = Core::preferredStreamRoute(m_routes, QString::fromStdString(config.last_rtmp_address),
 							m_proxySettings.streamEnabled());
+	UI::StreamRouteActions actions;
+	actions.obsActive = [] {
+		return obs_frontend_streaming_active();
+	};
+	actions.sessionActive = [this] {
+		return m_config.config().managed_session;
+	};
+	actions.canStartObs = [this] {
+		return !m_operationInFlight && !m_stopSyncInFlight && !m_shuttingDown &&
+		       m_config.config().managed_session && !obs_frontend_streaming_active();
+	};
+	actions.startObs = [this](const QString &address, QString &error) {
+		return startPreparedObs(address, error);
+	};
 	UI::streamRoutesDialog(
 		static_cast<QWidget *>(obs_frontend_get_main_window()), m_routes, selected, config.last_rtmp_key,
 		m_proxySettings.streamEnabled(), config.managed_session,
@@ -1238,7 +1250,8 @@ void BilibiliStreamPlugin::onStreamRoutes()
 				return false;
 			}
 			return true;
-		});
+		},
+		std::move(actions));
 }
 
 void BilibiliStreamPlugin::onSyncSettings()

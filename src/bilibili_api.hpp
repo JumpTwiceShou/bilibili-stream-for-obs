@@ -52,8 +52,7 @@ public:
 	static bool getLiveStatus(const Config &config, bool &is_live, std::string &message);
 	static json11::Json getPartitionList(std::string &message);
 	static bool startLive(Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
-			      std::string &face_qr, int &face_auth_code, std::string &mid,
-			      std::string *risk_voucher = nullptr, const std::string &gaia_token = {});
+			      std::string &face_qr, int &face_auth_code, std::string &mid);
 	static bool isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
 					       std::string &message);
 	static bool stopLive(const Config &config, std::string &message);

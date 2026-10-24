@@ -8,15 +8,25 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QVBoxLayout>
+#include <QTimer>
 
 namespace UI {
 void streamRoutesDialog(QWidget *parent, const Core::StreamRoutes &routes, int selected, const std::string &key,
-			bool streamProxy, bool currentSession, std::function<bool(const QString &, QString &)> apply)
+			bool streamProxy, bool currentSession, std::function<bool(const QString &, QString &)> apply,
+			StreamRouteActions actions)
 {
 	QDialog dialog(parent);
-	dialog.setWindowTitle(QStringLiteral("推流地址与线路"));
+	dialog.setWindowTitle(currentSession ? QStringLiteral("B 站开播成功 · 推流地址与线路")
+					     : QStringLiteral("推流地址与线路"));
 	dialog.resize(700, 420);
 	auto *layout = new QVBoxLayout(&dialog);
+	auto *liveStatus = new QLabel;
+	liveStatus->setObjectName("streamSessionStatus");
+	liveStatus->setWordWrap(true);
+	QFont headingFont = liveStatus->font();
+	headingFont.setBold(true);
+	liveStatus->setFont(headingFont);
+	layout->addWidget(liveStatus);
 	auto *note = new QLabel(
 		streamProxy
 			? QStringLiteral("OBS 推流走代理：默认选择本次经代理开播后 B 站返回的地址。")
@@ -38,6 +48,8 @@ void streamRoutesDialog(QWidget *parent, const Core::StreamRoutes &routes, int s
 	address->setObjectName("streamRouteAddress");
 	layout->addWidget(address);
 	auto *status = new QLabel;
+	status->setObjectName("streamRouteStatus");
+	status->setTextFormat(Qt::PlainText);
 	status->setWordWrap(true);
 	status->setText(
 		currentSession
@@ -54,8 +66,43 @@ void streamRoutesDialog(QWidget *parent, const Core::StreamRoutes &routes, int s
 	layout->addWidget(copy);
 	layout->addWidget(copyKey);
 	layout->addWidget(replace);
+	auto *hint = new QLabel(QStringLiteral("一键推流将使用当前所选线路启动 OBS。关闭窗口不会关闭 B 站直播。"));
+	hint->setWordWrap(true);
+	layout->addWidget(hint);
 	auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+	buttons->button(QDialogButtonBox::Close)->setText(QStringLiteral("关闭"));
+	auto *start = buttons->addButton(QStringLiteral("一键推流"), QDialogButtonBox::ActionRole);
+	start->setObjectName("startObsStream");
+	for (auto *button : {copy, copyKey, replace, start, buttons->button(QDialogButtonBox::Close)})
+		button->setAutoDefault(false);
 	layout->addWidget(buttons);
+	bool pending = false;
+	const auto refresh = [&] {
+		const bool active = actions.obsActive && actions.obsActive();
+		const bool session = actions.sessionActive ? actions.sessionActive() : currentSession;
+		dialog.setWindowTitle(session ? QStringLiteral("B 站开播成功 · 推流地址与线路")
+					      : QStringLiteral("推流地址与线路"));
+		liveStatus->setText(session ? (active ? QStringLiteral("B 站开播成功，OBS 正在推流。")
+						      : QStringLiteral("B 站开播成功，OBS 尚未开始推流。"))
+					    : QStringLiteral("历史推流线路：尚未确认当前 B 站直播状态。"));
+		start->setEnabled(!pending && session && !active && !key.empty() && !routes.isEmpty() &&
+				  bool(actions.startObs) && (!actions.canStartObs || actions.canStartObs()));
+		replace->setEnabled(!pending && !active && !key.empty() && !routes.isEmpty());
+	};
+	QObject::connect(start, &QPushButton::clicked, &dialog, [&] {
+		if (!start->isEnabled() || pending)
+			return;
+		pending = true;
+		refresh();
+		QString error;
+		if (actions.startObs && actions.startObs(address->text(), error)) {
+			dialog.accept();
+			return;
+		}
+		pending = false;
+		status->setText(error.isEmpty() ? QStringLiteral("OBS 推流未能启动，请检查当前直播状态。") : error);
+		refresh();
+	});
 	QObject::connect(list, &QListWidget::currentItemChanged, &dialog, [address](QListWidgetItem *item) {
 		address->setText(item ? item->data(Qt::UserRole).toString() : QString());
 	});
@@ -77,6 +124,10 @@ void streamRoutesDialog(QWidget *parent, const Core::StreamRoutes &routes, int s
 	});
 	QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 	list->setCurrentRow(selected >= 0 ? selected : 0);
+	QTimer stateTimer(&dialog);
+	QObject::connect(&stateTimer, &QTimer::timeout, &dialog, refresh);
+	stateTimer.start(250);
+	refresh();
 	dialog.exec();
 }
 } // namespace UI

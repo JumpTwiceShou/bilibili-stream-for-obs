@@ -18,7 +18,7 @@ struct ControlState {
 	bool openRoomEnabled = false;
 };
 
-enum class FaceAuthRetryDecision { Started, ContinueWaiting, ChallengeChanged, Failed };
+enum class FaceAuthRetryDecision { Started, ContinueWaiting, Failed };
 
 std::string extractCookieValue(const std::string &cookies, const std::string &key);
 std::string encodeFormComponent(const std::string &value);

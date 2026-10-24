@@ -223,8 +223,7 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 				return;
 			}
 			timer.stop();
-			if (decision == Core::FaceAuthRetryDecision::Started ||
-			    decision == Core::FaceAuthRetryDecision::ChallengeChanged)
+			if (decision == Core::FaceAuthRetryDecision::Started)
 				guard->accept();
 			else {
 				statusLabel->setText(text("Dialog.StartFailed"));
