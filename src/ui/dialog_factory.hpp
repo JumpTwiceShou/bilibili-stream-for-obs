@@ -25,18 +25,19 @@ public:
 	using QrPollCallback =
 		std::function<void(Bili::BiliApi::QrLoginResult result, std::string cookies, std::string message)>;
 	using QrPollRequest = std::function<void(QrPollCallback callback)>;
-	using FacePollCallback = std::function<void(bool requestSucceeded, bool identified, std::string statusMessage)>;
+	using FacePollCallback = std::function<void(Bili::FaceAuthStatus status)>;
 	using FacePollRequest = std::function<void(FacePollCallback callback)>;
 	using FaceRetryCallback = std::function<void(Core::FaceAuthRetryDecision decision, std::string faceUrl,
 						     std::string statusMessage)>;
 	using FaceRetryRequest = std::function<void(FaceRetryCallback callback)>;
 
 	static void message(const QString &msg, const QString &title, QWidget *parent = nullptr);
-	static bool confirm(const QString &msg, const QString &title, QWidget *parent = nullptr);
+	static bool confirm(const QString &msg, const QString &title, QWidget *parent = nullptr,
+			    const QString &acceptText = {});
 	static void qrLogin(QWidget *parent, const std::string &qrData, QrPollRequest requestPoll,
 			    std::function<void(const std::string &cookies)> onSuccess);
 	static bool faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
-			     FaceRetryRequest requestRetry);
+			     FaceRetryRequest requestRetry, bool requiresVerification = false);
 	static void roomSettings(QWidget *parent, const std::string &roomUrl, const std::string &currentTitle,
 				 int currentAreaId, int currentPartId, const json11::Json &partitionData,
 				 RoomApplyRequest onApply);

@@ -3,6 +3,7 @@
 #include "core/account_state.hpp"
 #include "core/login_utils.hpp"
 #include "http_client.hpp"
+#include <QByteArray>
 #include <QCoreApplication>
 #include <deque>
 #include <iostream>
@@ -72,6 +73,13 @@ HttpResponse HttpClient::post(const std::string &url, const std::string &body, c
 	requests.back().headers = headers;
 	return response;
 }
+HttpResponse HttpClient::postWithoutRedirects(const std::string &url, const std::string &body,
+					      const std::vector<std::string> &headers, long)
+{
+	auto response = take("POST-no-redirect", url, body);
+	requests.back().headers = headers;
+	return response;
+}
 } // namespace Http
 
 int main(int argc, char **argv)
@@ -132,59 +140,128 @@ int main(int argc, char **argv)
 	config.cookies = complete;
 	config.area_id = 86;
 	const auto version = reply(R"({"code":0,"data":{"build":123,"curr_version":"fixture"}})");
-	std::string address, key, face, mid = "42";
-	int faceCode = 0;
+	std::string address, key;
+	Bili::StartLiveFollowUp followUp;
+	auto start = [&]() {
+		return Api::startLive(config, address, key, message, followUp);
+	};
 	reset({version, reply(R"({"code":60024,"msg":"当前IP开播要求粉丝数大于100"})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) &&
-		      Core::isIpFollowerRestriction(message) && face.empty() && faceCode == 0,
+	check(!start() && Core::isIpFollowerRestriction(message) && followUp.faceUrl.empty() &&
+		      followUp.faceCode == 0,
 	      "msg-only follower restriction is preserved before face-code classification");
 	reset({version, reply(R"({"code":60024,"data":{"qr":"https://www.bilibili.com/face"}})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !face.empty() && faceCode == 60024,
+	check(!start() && !followUp.faceUrl.empty() && followUp.faceCode == 60024,
 	      "face-required responses still produce face verification");
 	reset({version, reply(R"({"code":60028,"data":{"qr":"https://www.bilibili.com/new-anchor-face"}})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !face.empty() && faceCode == 60028,
+	check(!start() && !followUp.faceUrl.empty() && followUp.faceCode == 60028,
 	      "new-anchor room verification follows the official 60028 flow");
 	reset({version, reply(R"({"code":60043,"data":{"risk_extra":{"v_voucher":"fixture-voucher"}}})")});
-	const std::string legacyFaceUrl =
-		"https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=42";
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && face == legacyFaceUrl &&
-		      faceCode == 60043 && address.empty() && key.empty(),
-	      "60043 restores the native QR path even when the response includes an SDK voucher");
+	check(!start() && followUp.faceUrl.empty() && followUp.riskVoucher == "fixture-voucher" &&
+		      followUp.faceCode == 60043 && address.empty() && key.empty(),
+	      "60043 hands the official voucher to the caller without starting or using the room QR path");
 	reset({version, reply(R"({"code":60043,"data":{}})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) && face == legacyFaceUrl &&
-		      faceCode == 60043,
-	      "native QR display does not depend on an SDK voucher");
-	mid = "42&source_event=other";
-	reset({version, reply(R"({"code":60043})")});
-	check(!Api::startLive(config, address, key, message, face, faceCode, mid) &&
-		      face == legacyFaceUrl + "%26source_event%3Dother",
-	      "native QR account parameter remains URL encoded");
-	mid = "42";
+	check(!start() && followUp.riskVoucher.empty() && followUp.faceUrl.empty() &&
+		      followUp.faceCode == 60043 && message.find("凭证") != std::string::npos,
+	      "60043 without a voucher produces an actionable error and clears the previous challenge");
 	bool identified = true;
-	reset({});
-	check(!Api::isUserIdentifiedByFaceAuth(config, 12345, identified, message) && !identified && requests.empty(),
-	      "unknown challenge types cannot issue a face-status request");
-	for (const auto code : {60024, 60028, 60043}) {
+	for (const auto code : {60043, 12345}) {
+		reset({});
+		identified = true;
+		check(!Api::isUserIdentifiedByFaceAuth(config, code, identified, message) && !identified && requests.empty(),
+		      "official risk and unknown challenges cannot issue a room face-status request");
+	}
+	for (const auto code : {60024, 60028}) {
 		reset({reply(R"({"code":0,"data":{"is_identified":true}})")});
 		check(Api::isUserIdentifiedByFaceAuth(config, code, identified, message) && identified &&
 			      requests.back().body.find("face_auth_code=" + std::to_string(code)) != std::string::npos,
 		      "native face-status polling preserves the original challenge type");
 	}
+	// StartLive-compatible fixtures with a signed 32-bit secret index and UTF-8 token.
+	const std::string realnameContent =
+		"MTc5NTcwMDAwMDAwMHxmaXh0dXJlLXNlcnZlci1zYWx0fC0yMTQ3NDgzNTE4fGlST1dSZEg3UzBVQzAwWEJt"
+		"WTZlZkpjVHpoN1Y4UUlhVG9NYWdwT0poMldIUTRjUnd2WUlFMHpFVHNlUXpZdCttVlNNRVVVbXhKbTJKZ0xk";
+	const std::string otherTypeContent =
+		"MTc5NTcwMDAwMDAwMHxmaXh0dXJlLXNlcnZlci1zYWx0fC0yMTQ3NDgzNTE4fGlST1dSZEg3UzBVQ3hrWEZn"
+		"WVdNWmRBZHdFak85UXdSQXBzQ3hweVlpMlNBVk05ZnlmOEZFMFhQUjhYWWxKQjZsMS9QRFpPdFN3ST0=";
+	const auto registration = [](const std::string &content) {
+		return reply(R"({"code":0,"data":{"content":")" + content + R"("}})");
+	};
+	const auto unmask = [](const QByteArray &encoded) {
+		const auto bytes = QByteArray::fromBase64(encoded, QByteArray::AbortOnBase64DecodingErrors);
+		if (bytes.size() <= 9)
+			return QByteArray{};
+		QByteArray token(bytes.size() - 9, Qt::Uninitialized);
+		for (qsizetype i = 0; i < token.size(); ++i)
+			token[i] = static_cast<char>(bytes[i + 1] ^ bytes[0] ^ bytes[token.size() + 1 + i % 8]);
+		return token;
+	};
+	const std::string qrPrefix = "https://www.bilibili.com/h5/risk-control/realname?t=";
+	const QByteArray fixtureToken = "fixture-challenge-token-中文";
+	Bili::RealnameChallenge realname;
+	reset({registration(realnameContent)});
+	check(Api::registerRealnameChallenge(config, "fixture-voucher", realname, message) &&
+		      requests.size() == 1 && requests.back().method == "POST-no-redirect" &&
+		      requests.back().url == "https://api.bilibili.com/x/gaia-vgate/v2/register" &&
+		      requests.back().body == "v_voucher=fixture-voucher&dm_track=%5B%5D&csrf=fixture-csrf" &&
+		      requests.back().headers.back() == "Cookie: " + complete,
+	      "realname registration uses the current voucher and authenticated official endpoint");
+	check(realname.qrUrl.rfind(qrPrefix, 0) == 0 &&
+		      unmask(QByteArray::fromPercentEncoding(QByteArray::fromPercentEncoding(
+			      QByteArray::fromStdString(realname.qrUrl.substr(qrPrefix.size()))))) == fixtureToken &&
+		      unmask(QByteArray::fromStdString(realname.pollToken)) == fixtureToken,
+	      "mobile QR and polling token both decode to the current UTF-8 challenge token");
+	using Status = Bili::FaceAuthStatus;
+	for (const auto &[response, status] : std::vector<std::pair<std::string, Status>>{
+		     {R"({"code":0,"data":{"status":0}})", Status::Pending},
+		     {R"({"code":0,"data":{"status":1}})", Status::Verified},
+		     {R"({"code":0,"data":{"status":2}})", Status::Expired},
+		     {R"({"code":0,"data":{"status":3}})", Status::Expired},
+		     {R"({"code":0,"data":{"status":"1"}})", Status::Unavailable},
+		     {R"({"code":0,"data":{"status":true}})", Status::Unavailable},
+		     {R"({"code":0,"data":{}})", Status::Unavailable},
+		     {R"({"code":-101,"data":{"status":1}})", Status::Unavailable}}) {
+		reset({reply(response)});
+		check(Api::queryRealnameChallenge(config, realname.pollToken) == status && requests.size() == 1 &&
+			      requests.back().method == "POST-no-redirect" &&
+			      requests.back().url == "https://api.bilibili.com/x/gaia-vgate/v2/validatePreCheck" &&
+			      requests.back().body == "token=" + Core::encodeFormComponent(realname.pollToken) +
+								"&dm_track=%7B%22dm_img_list%22%3A%5B%5D%7D"
+								"&csrf=fixture-csrf",
+		      "only the current challenge status 1 can verify a scan");
+	}
+	reset({registration(otherTypeContent)});
+	check(!Api::registerRealnameChallenge(config, "fixture-voucher", realname, message) &&
+		      realname.qrUrl.empty() && realname.pollToken.empty() && message.find("直播中心") != std::string::npos,
+	      "other challenge types send the user to Live Center without a QR or retained token");
+	reset({registration(realnameContent)});
+	check(!Api::registerRealnameChallenge(config, "wrong-voucher", realname, message) &&
+		      realname.qrUrl.empty() && realname.pollToken.empty(),
+	      "a registration response cannot open a QR for another voucher");
 	const auto originalCookies = config.cookies;
-	reset({version, reply(R"({"code":0,"data":{"rtmp":{"addr":"rtmp://fixture/live","code":"fixture-key"}}})")});
-	check(Api::startLive(config, address, key, message, face, faceCode, mid) &&
-		      config.cookies == originalCookies && face.empty() && faceCode == 0,
-	      "confirmed start clears the prior QR challenge and retains account cookies");
-	bool sentToken = false;
-	for (const auto &header : requests.back().headers)
-		sentToken |= header.find("x-bili-gaia-vtoken=") != std::string::npos;
-	check(!sentToken, "start requests no longer inject a browser SDK completion token");
+	const auto started = reply(R"({"code":0,"data":{"rtmp":{"addr":"rtmp://fixture/live","code":"fixture-key"}}})");
+	Http::HttpResponse timedOut;
+	timedOut.timeout = true;
+	reset({timedOut});
+	check(!start() && followUp.versionTimedOut && requests.size() == 1 &&
+		      requests.front().method == "GET" && requests.front().headers.back() == "Cookie: " + originalCookies,
+	      "version timeout allows retry before any start POST");
+	reset({version, timedOut});
+	check(!start() && !followUp.versionTimedOut && requests.size() == 2,
+	      "an ambiguous POST timeout is not classified as a retryable version GET timeout");
+	const auto latestVersion = reply(R"({"code":0,"data":{"build":456,"curr_version":"latest-fixture"}})");
+	reset({latestVersion, started});
+	check(start() && config.cookies == originalCookies && followUp.faceUrl.empty() &&
+		      followUp.riskVoucher.empty() && !followUp.versionTimedOut && requests.size() == 2 &&
+		      requests.front().headers.back() == "Cookie: " + originalCookies &&
+		      requests.back().headers.back() == "Cookie: " + originalCookies &&
+		      requests.back().body.find("build=456") != std::string::npos &&
+		      requests.back().body.find("version=latest-fixture") != std::string::npos,
+	      "manual retry uses the newly fetched version with the original login session");
 	for (const auto *bad : {R"({"code":-500})", R"({"code":-500,"message":" ","msg":"稍后重试"})",
 				R"({"data":{"rtmp":{"addr":"bad","code":"bad"}}})", R"({"code":0})", "invalid"}) {
 		reset({version, reply(bad)});
 		address = key = "stale";
-		check(!Api::startLive(config, address, key, message, face, faceCode, mid) && !message.empty() &&
-			      address.empty() && key.empty(),
+		check(!start() && !message.empty() && address.empty() && key.empty(),
 		      "failed start has useful text and cannot retain old streaming credentials");
 	}
 	reset({reply(R"({"code":-500,"msg":"stop-denied"})")});
@@ -233,6 +310,16 @@ int main(int argc, char **argv)
 	check(state.loggedIn && state.roomAvailable && state.liveStatusKnown && !state.isLive &&
 		      state.config.selected_rtmp_address == account.selected_rtmp_address && state.message.empty(),
 	      "same-account verified login preserves route preference and enables a confirmed room");
+	reset({nav42, timedOut, room42, reply(R"({"code":0,"data":{"liveStatus":0}})")});
+	state = Core::queryAccountState(same);
+	check(state.loggedIn && state.roomAvailable && state.config.room_id == "42" && requests.size() == 4 &&
+		      requests[1].url == requests[2].url && requests[2].method == "GET",
+	      "a single room lookup timeout retries the read-only request and recovers without a new login");
+	reset({nav42, timedOut, timedOut});
+	state = Core::queryAccountState(same);
+	check(state.loggedIn && !state.roomAvailable && state.message.find("获取房间号超时") != std::string::npos &&
+		      requests.size() == 3,
+	      "repeated room lookup timeouts stop after one retry and retain login state");
 	reset({nav42, reply(R"({"code":-500,"message":"room lookup unavailable"})")});
 	state = Core::queryAccountState(same);
 	check(state.loggedIn && !state.roomAvailable && state.config.room_id.empty() &&
@@ -296,6 +383,7 @@ int main(int argc, char **argv)
 	check(!state.requestSucceeded && state.config.last_rtmp_key == account.last_rtmp_key,
 	      "a transient nav transport failure cannot silently expire the active account");
 	reset({reply(R"({"code":0,"data":{"isLogin":true}})")});
+	std::string mid;
 	check(!Api::checkLoginStatus(complete, live, message, mid) && !live,
 	      "missing verified account identity cannot authenticate a room lookup");
 	check(replies.empty(), "all API fixtures consumed");

@@ -260,6 +260,10 @@ bool BiliApi::getRoomIdAndCsrf(const std::string &cookies, std::string &room_id,
 			  Core::encodeFormComponent(dede_user_id);
 	auto headers = buildHeaders(cookies);
 	auto response = Http::HttpClient::get(url, headers);
+	if (!response.cancelled && (response.timeout || (response.status >= 500 && response.status < 600))) {
+		obs_log(LOG_WARNING, "Room ID lookup encountered a transient error; retrying once");
+		response = Http::HttpClient::get(url, headers);
+	}
 	if (!requireSuccessfulResponse(response, "获取房间号", message)) {
 		return false;
 	}
@@ -389,11 +393,10 @@ json11::Json BiliApi::getPartitionList(std::string &message)
 	return json["data"];
 }
 
-bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
-			std::string &face_qr, int &face_auth_code, std::string &mid)
+bool BiliApi::startLive(const Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
+			StartLiveFollowUp &followUp)
 {
-	face_qr.clear();
-	face_auth_code = 0;
+	followUp = {};
 	rtmp_addr.clear();
 	rtmp_code.clear();
 	if (config.room_id.empty() || config.csrf_token.empty()) {
@@ -412,6 +415,7 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 	auto headers = buildHeaders(config.cookies);
 	auto version_response = Http::HttpClient::get(version_url, headers);
 	if (!requireSuccessfulResponse(version_response, "获取直播版本信息", message)) {
+		followUp.versionTimedOut = version_response.timeout;
 		return false;
 	}
 
@@ -456,21 +460,19 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 			return false;
 
 		if (code == 60024 || code == 60028) {
-			std::string face_url = json["data"]["qr"].string_value();
 			obs_log(LOG_WARNING, "Start-live requires room face authentication (code %d)", code);
 			message = "需要人脸验证，请扫描二维码";
-			face_qr = face_url;
-			face_auth_code = code;
+			followUp.faceUrl = json["data"]["qr"].string_value();
+			followUp.faceCode = code;
 			return false;
 		}
 		if (code == 60043) {
-			// Restore the native QR entry used before the embedded-browser regression.
-			face_qr =
-				"https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=" +
-				Core::encodeFormComponent(mid);
-			obs_log(LOG_WARNING, "Start-live requires face authentication (code 60043)");
-			message = "需要人脸验证，请扫描二维码";
-			face_auth_code = code;
+			obs_log(LOG_WARNING, "Start-live requires official risk verification (code 60043)");
+			followUp.faceCode = code;
+			followUp.riskVoucher = json["data"]["risk_extra"]["v_voucher"].string_value();
+			message = followUp.riskVoucher.empty()
+					  ? "B 站要求官方安全验证，但响应缺少本次验证凭证。请重试开播或使用官方直播中心。"
+					  : "需要完成本次官方安全验证";
 			return false;
 		}
 		return false;
@@ -485,12 +487,66 @@ bool BiliApi::startLive(Config &config, std::string &rtmp_addr, std::string &rtm
 	return true;
 }
 
+bool BiliApi::registerRealnameChallenge(const Config &config, const std::string &voucher,
+					 RealnameChallenge &challenge, std::string &message)
+{
+	challenge = {};
+	if (config.cookies.empty() || config.csrf_token.empty() || voucher.empty() || voucher.size() > 4096) {
+		message = "启动官方人脸验证失败：缺少登录信息或有效的验证凭证";
+		return false;
+	}
+	const auto form = Core::buildFormBody({{"v_voucher", voucher}, {"dm_track", "[]"}, {"csrf", config.csrf_token}});
+	const auto reply = Http::HttpClient::postWithoutRedirects("https://api.bilibili.com/x/gaia-vgate/v2/register",
+								form, buildHeaders(config.cookies));
+	json11::Json json;
+	constexpr auto action = "获取官方人脸验证二维码";
+	if (!requireSuccessfulResponse(reply, action, message) || !readApiReply(reply, action, json, message))
+		return false;
+	switch (decodeRealnameChallenge(voucher, json["data"]["content"].string_value(), challenge)) {
+	case RealnameDecodeResult::Ready:
+		obs_log(LOG_INFO, "Registered Bilibili realname challenge");
+		message.clear();
+		return true;
+	case RealnameDecodeResult::OtherType:
+		obs_log(LOG_INFO, "Bilibili challenge requires the official Live Center");
+		message = "本次安全验证需要在 B 站直播中心完成";
+		return false;
+	case RealnameDecodeResult::Invalid:
+		obs_log(LOG_WARNING, "Invalid response during Bilibili realname challenge registration");
+		message = "B 站返回的验证数据无效，请重新开播或打开 B 站直播中心";
+		return false;
+	}
+	return false;
+}
+
+FaceAuthStatus BiliApi::queryRealnameChallenge(const Config &config, const std::string &pollToken)
+{
+	if (config.cookies.empty() || config.csrf_token.empty() || pollToken.empty())
+		return FaceAuthStatus::Unavailable;
+	const auto form = Core::buildFormBody(
+		{{"token", pollToken}, {"dm_track", R"({"dm_img_list":[]})"}, {"csrf", config.csrf_token}});
+	const auto reply = Http::HttpClient::postWithoutRedirects(
+		"https://api.bilibili.com/x/gaia-vgate/v2/validatePreCheck", form, buildHeaders(config.cookies));
+	constexpr auto action = "查询官方人脸验证状态";
+	std::string message;
+	json11::Json json;
+	if (!requireSuccessfulResponse(reply, action, message) || !readApiReply(reply, action, json, message))
+		return FaceAuthStatus::Unavailable;
+	const auto &value = json["data"]["status"];
+	int status = 0;
+	if (!value.is_number() || !Core::jsonInteger(value, status))
+		return FaceAuthStatus::Unavailable;
+	if (status >= 2)
+		return FaceAuthStatus::Expired;
+	return status == 1 ? FaceAuthStatus::Verified : FaceAuthStatus::Pending;
+}
+
 bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
 					 std::string &message)
 {
 	is_identified = false;
 	if (config.room_id.empty() || config.csrf_token.empty() ||
-	    (face_auth_code != 60024 && face_auth_code != 60028 && face_auth_code != 60043)) {
+	    (face_auth_code != 60024 && face_auth_code != 60028)) {
 		message = "查询人脸认证状态失败: 配置或认证类型无效";
 		return false;
 	}

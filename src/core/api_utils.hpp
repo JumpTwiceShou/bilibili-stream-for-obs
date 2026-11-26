@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,15 +17,30 @@ struct ControlState {
 	bool streamToggleEnabled = false;
 	bool updateRoomEnabled = false;
 	bool openRoomEnabled = false;
+	bool refreshRoomEnabled = false;
 };
 
-enum class FaceAuthRetryDecision { Started, ContinueWaiting, Failed };
+enum class FaceAuthRetryDecision { Started, ContinueWaiting, ChallengeChanged, VersionTimedOut, Failed };
+
+class FaceAuthRetryPolicy {
+public:
+	static constexpr int pollIntervalMs = 1500;
+	static constexpr std::int64_t timeoutMs = 600000;
+	bool expired(std::int64_t elapsedMs) const;
+	bool shouldRetry(bool querySucceeded, bool identified, std::int64_t elapsedMs) const;
+	void deferRetry(std::int64_t elapsedMs);
+
+private:
+	std::int64_t nextRetryAtMs = 0;
+	int retryDelayMs = 5000;
+};
 
 std::string extractCookieValue(const std::string &cookies, const std::string &key);
 std::string encodeFormComponent(const std::string &value);
 std::string buildFormBody(const std::vector<std::pair<std::string, std::string>> &params);
 bool jsonInteger(const json11::Json &value, int &result, int minimum = 0);
 bool apiResponseCode(const json11::Json &response, int &code);
+std::string newerReleaseVersion(const json11::Json &release, const std::string &installedVersion);
 std::string apiErrorMessage(const json11::Json &response, const std::string &action);
 bool faceAuthIdentified(const json11::Json &response, bool &identified);
 bool isIpFollowerRestriction(const std::string &message);

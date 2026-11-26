@@ -2,14 +2,15 @@
 #include "qrcodegen/qrcodegen.hpp"
 #include <QImage>
 #include <QPainter>
+#include <algorithm>
 
 namespace Core {
-QPixmap QrGenerator::generate(const std::string &data)
+QPixmap QrGenerator::generate(const std::string &data, int maxSize)
 {
-	return generate(QString::fromStdString(data));
+	return generate(QString::fromStdString(data), maxSize);
 }
 
-QPixmap QrGenerator::generate(const QString &data)
+QPixmap QrGenerator::generate(const QString &data, int maxSize)
 {
 	if (data.isEmpty()) {
 		return QPixmap();
@@ -21,9 +22,9 @@ QPixmap QrGenerator::generate(const QString &data)
 		return QPixmap();
 	}
 
-	const int scale = 10;
 	const int border = 4;
 	const int size = qr.getSize();
+	const int scale = maxSize > 0 ? std::clamp(maxSize / (size + border * 2), 1, 10) : 10;
 	QImage image((size + border * 2) * scale, (size + border * 2) * scale, QImage::Format_RGB32);
 	image.fill(Qt::white);
 	QPainter painter(&image);

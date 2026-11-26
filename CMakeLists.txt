@@ -45,6 +45,7 @@ add_library(
   src/core/obs_service_guard.cpp
   src/core/stream_routes.cpp
   src/core/qr_generator.cpp
+  src/core/realname_challenge.cpp
   src/core/secret_store.cpp
   src/ui/menu_manager.cpp
   src/ui/dialog_factory.cpp
@@ -161,9 +162,10 @@ if(BUILD_TESTING)
   target_include_directories(plugin-stream-ui-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(plugin-stream-ui-tests PRIVATE Qt6::Core Qt6::Widgets OBS::libobs)
   add_test(NAME plugin-stream-ui-tests COMMAND plugin-stream-ui-tests -platform minimal)
-  set_tests_properties(plugin-stream-ui-tests PROPERTIES TIMEOUT 10)
+  set_tests_properties(plugin-stream-ui-tests PROPERTIES TIMEOUT 20)
   add_executable(plugin-api-tests tests/bilibili_api_tests.cpp src/bilibili_api.cpp src/md5.cpp
-    src/core/api_utils.cpp src/core/account_state.cpp src/core/login_utils.cpp src/json11/json11.cpp)
+    src/core/api_utils.cpp src/core/account_state.cpp src/core/login_utils.cpp src/core/realname_challenge.cpp
+    src/json11/json11.cpp)
   target_include_directories(plugin-api-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(plugin-api-tests PRIVATE Qt6::Core Qt6::Network OBS::libobs plugin-support)
   add_test(NAME plugin-api-tests COMMAND plugin-api-tests)

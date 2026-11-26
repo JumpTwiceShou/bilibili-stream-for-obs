@@ -71,7 +71,7 @@ void DialogFactory::message(const QString &msg, const QString &title, QWidget *p
 	dialog.exec();
 }
 
-bool DialogFactory::confirm(const QString &msg, const QString &title, QWidget *parent)
+bool DialogFactory::confirm(const QString &msg, const QString &title, QWidget *parent, const QString &acceptText)
 {
 	QDialog dialog(defaultParent(parent));
 	configureDialog(dialog, title);
@@ -81,7 +81,7 @@ bool DialogFactory::confirm(const QString &msg, const QString &title, QWidget *p
 	dialogLayout(dialog)->addWidget(label);
 	QHBoxLayout *buttons = new QHBoxLayout();
 	QPushButton *cancel = new QPushButton(text("Common.Cancel"));
-	QPushButton *confirm = new QPushButton(text("Common.Confirm"));
+	QPushButton *confirm = new QPushButton(acceptText.isEmpty() ? text("Common.Confirm") : acceptText);
 	buttons->addWidget(cancel);
 	buttons->addWidget(confirm);
 	dialogLayout(dialog)->addLayout(buttons);
@@ -156,12 +156,13 @@ void DialogFactory::qrLogin(QWidget *parent, const std::string &qrData, QrPollRe
 }
 
 bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePollRequest requestPoll,
-			     FaceRetryRequest requestRetry)
+			     FaceRetryRequest requestRetry, bool requiresVerification)
 {
+	constexpr int maxQrSize = 480;
 	FaceDialog dialog(parent);
 	configureDialog(dialog, text("Face.Title"));
 	QLabel *qrLabel = new QLabel();
-	const QPixmap pixmap = Core::QrGenerator::generate(faceUrl);
+	const QPixmap pixmap = Core::QrGenerator::generate(faceUrl, maxQrSize);
 	if (pixmap.isNull()) {
 		qrLabel->setText(text("Face.GenerateFailed"));
 	} else {
@@ -172,6 +173,7 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	tipLabel->setWordWrap(true);
 	tipLabel->setAlignment(Qt::AlignCenter);
 	QLabel *statusLabel = new QLabel(text("Face.Waiting"));
+	statusLabel->setObjectName("faceWaitingStatus");
 	statusLabel->setWordWrap(true);
 	statusLabel->setAlignment(Qt::AlignCenter);
 	QPushButton *closeButton = new QPushButton(text("Face.Cancel"));
@@ -181,31 +183,56 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 	dialogLayout(dialog)->addWidget(closeButton);
 
 	auto *retryButton = new QPushButton(text("Face.ManualRetry"));
+	retryButton->setEnabled(!requiresVerification);
 	dialogLayout(dialog)->insertWidget(3, retryButton);
-	auto *detail = new QLabel;
+	auto *detail = new QLabel(requiresVerification ? QString{} : text("Face.WaitingHint"));
+	detail->setObjectName("faceWaitingDetail");
 	detail->setWordWrap(true);
 	detail->setTextFormat(Qt::PlainText);
 	dialogLayout(dialog)->insertWidget(3, detail);
 	struct PollState {
 		bool inFlight = false;
-		bool positiveConsumed = false;
+		bool manualRetryOnly = false;
+		bool verified = false;
+		bool expired = false;
+		Core::FaceAuthRetryPolicy retryPolicy;
 		QElapsedTimer elapsed;
 	};
 	auto state = std::make_shared<PollState>();
 	state->elapsed.start();
 	QTimer timer(&dialog);
-	// Matches the official room-verification component; one explicit success is sufficient.
-	timer.setInterval(1500);
+	timer.setInterval(Core::FaceAuthRetryPolicy::pollIntervalMs);
 	QPointer<QDialog> guard(&dialog);
-	const auto retry = [guard, state, &timer, qrLabel, statusLabel, detail, retryButton, requestRetry]() {
-		if (!guard || state->inFlight)
+	const auto showExpired = [state, &timer, qrLabel, statusLabel, detail, retryButton, requiresVerification]() {
+		state->expired = true;
+		timer.stop();
+		if (requiresVerification)
+			qrLabel->clear();
+		statusLabel->setText(text(requiresVerification ? "Face.ChallengeExpired" : "Face.Timeout"));
+		detail->clear();
+		retryButton->setEnabled(false);
+	};
+	const auto expire = [state, showExpired]() {
+		if (!state->expired && (state->verified || !state->retryPolicy.expired(state->elapsed.elapsed())))
+			return false;
+		showExpired();
+		return true;
+	};
+	const auto retry = [guard, state, &timer, qrLabel, statusLabel, detail, retryButton, requestRetry,
+			    expire, requiresVerification]() {
+		if (!guard || state->inFlight || (requiresVerification && !state->verified))
+			return;
+		if (expire())
 			return;
 		state->inFlight = true;
-		state->positiveConsumed = true;
+		if (requiresVerification) {
+			statusLabel->setText(text("Face.Retrying"));
+			detail->clear();
+		}
 		retryButton->setEnabled(false);
 		guard->setProperty("startPending", true);
 		requestRetry([guard, state, &timer, qrLabel, statusLabel, detail,
-			      retryButton](Core::FaceAuthRetryDecision decision, std::string retryFaceUrl,
+			      retryButton, expire](Core::FaceAuthRetryDecision decision, std::string retryFaceUrl,
 					   std::string retryMessage) {
 			if (!guard)
 				return;
@@ -213,17 +240,31 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 			guard->setProperty("startPending", false);
 			retryButton->setEnabled(true);
 			if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
+				if (expire())
+					return;
+				state->manualRetryOnly = false;
+				statusLabel->setText(text("Face.Waiting"));
+				detail->setText(text("Face.WaitingHint"));
+				state->retryPolicy.deferRetry(state->elapsed.elapsed());
 				if (!retryFaceUrl.empty()) {
-					const QPixmap retryPixmap = Core::QrGenerator::generate(retryFaceUrl);
+					const QPixmap retryPixmap = Core::QrGenerator::generate(retryFaceUrl, maxQrSize);
 					if (!retryPixmap.isNull())
 						qrLabel->setPixmap(retryPixmap);
 				}
-				// A stale positive must not repeatedly invoke startLive. Rearm only after pending -> success.
-				detail->setText(text("Face.ManualHint"));
+				// Keep waiting guidance stable while the same challenge remains active.
+				return;
+			}
+			if (decision == Core::FaceAuthRetryDecision::VersionTimedOut) {
+				if (expire())
+					return;
+				state->manualRetryOnly = true;
+				statusLabel->setText(text("Face.RetryAvailable"));
+				detail->setText(QString::fromUtf8(retryMessage));
 				return;
 			}
 			timer.stop();
-			if (decision == Core::FaceAuthRetryDecision::Started)
+			if (decision == Core::FaceAuthRetryDecision::Started ||
+			    decision == Core::FaceAuthRetryDecision::ChallengeChanged)
 				guard->accept();
 			else {
 				statusLabel->setText(text("Dialog.StartFailed"));
@@ -232,30 +273,35 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 			}
 		});
 	};
-	const auto poll = [guard, state, &timer, statusLabel, detail, retryButton, requestPoll, retry]() {
+	const auto poll = [guard, state, &timer, detail, requestPoll, retry, expire, showExpired, requiresVerification]() {
 		if (!guard || state->inFlight)
 			return;
-		if (state->elapsed.elapsed() > 600000) {
-			timer.stop();
-			statusLabel->setText(text("Face.Timeout"));
-			retryButton->setEnabled(false);
+		if (expire() || state->manualRetryOnly) {
 			return;
 		}
 		state->inFlight = true;
-		requestPoll([guard, state, detail, retryButton, retry](bool succeeded, bool identified, std::string) {
+		requestPoll([guard, state, &timer, detail, retry, expire, showExpired,
+			     requiresVerification](Bili::FaceAuthStatus status) {
 			if (!guard)
 				return;
 			state->inFlight = false;
-			if (!succeeded) {
-				detail->setText(text("Face.StatusUnavailable"));
+			if (expire()) {
 				return;
 			}
-			if (!identified) {
-				state->positiveConsumed = false;
-				detail->clear();
+			using Status = Bili::FaceAuthStatus;
+			if (status == Status::Expired) {
+				showExpired();
 				return;
 			}
-			if (!state->positiveConsumed)
+			if (requiresVerification) {
+				detail->setText(status == Status::Unavailable ? text("Face.StatusUnavailable") : QString{});
+				if (status == Status::Verified) {
+					state->verified = true;
+					timer.stop();
+				}
+			}
+			if (state->retryPolicy.shouldRetry(status != Status::Unavailable, status == Status::Verified,
+							   state->elapsed.elapsed()))
 				retry();
 		});
 	};

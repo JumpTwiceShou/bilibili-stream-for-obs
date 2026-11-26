@@ -4,10 +4,11 @@
 
 本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
 
-## 1.3.3 更新
+## 1.3.4 更新
 
-- 恢复原有的人脸验证二维码窗口，移除内嵌官方验证流程和 WebView2 依赖，修复验证窗口白屏问题。
-- 保留等待状态、手动重试及开播结果确认；线路窗口新增“一键推流”和“关闭”按钮。
+- B 站要求实名认证时，插件在原生窗口显示本次验证二维码，等待 B 站确认后自动重试开播。
+- 获取直播版本超时后可在原窗口重试。登录菜单新增「刷新登录与直播间状态」。
+- 开播失败时后台检查插件更新，有新版本即可进入 GitHub 最新发布页。
 
 ## 1.3.1 更新
 
@@ -26,7 +27,7 @@
 
 ### Windows
 
-1. 从本仓库 [Releases 页面](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases) 下载 `bilibili-stream-for-obs-1.3.3-windows-x64.zip`。
+1. 从本仓库 [最新发布页](https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/latest) 下载 Windows x64 安装包。
 2. 解压压缩包。
 3. 将解压后的 `bilibili-stream-for-obs` 文件夹放到 OBS 插件目录：
 
@@ -49,7 +50,7 @@
 
 5. 重启 OBS Studio，菜单栏中出现“Bilibili直播”即代表插件已加载。
 
-人脸验证使用插件内的二维码窗口，无需安装 WebView2。扫码完成后若未自动继续，可点击“验证完成，重试开播”；只有 B 站实际返回开播成功后才会继续推流。
+使用手机 Bilibili App 扫描插件窗口里的二维码完成人脸验证。B 站确认后，插件会自动重试开播。开播准备期间如果获取直播版本超时，可以在同一窗口手动重试。其他安全验证类型可前往 B 站直播中心。
 
 ## 使用方法
 

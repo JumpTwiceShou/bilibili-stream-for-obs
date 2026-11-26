@@ -27,6 +27,7 @@ void MenuManager::setupMenu()
 	m_actions.loginStatus = loginMenu->addAction(text("Menu.LoginStatus.LoggedOut"));
 	m_actions.loginStatus->setCheckable(true);
 	m_actions.loginStatus->setEnabled(false);
+	m_actions.refreshRoom = loginMenu->addAction(text("Menu.RefreshRoom"));
 	loginMenu->addSeparator();
 	m_actions.logout = loginMenu->addAction(text("Menu.Logout"));
 
@@ -39,6 +40,7 @@ void MenuManager::setupMenu()
 	m_actions.streamRoutes = bilibiliMenu->addAction(text("Menu.StreamRoutes"));
 
 	connect(m_actions.scanQrcode, &QAction::triggered, this, &MenuManager::scanQrcodeClicked);
+	connect(m_actions.refreshRoom, &QAction::triggered, this, &MenuManager::refreshRoomClicked);
 	connect(m_actions.logout, &QAction::triggered, this, &MenuManager::logoutClicked);
 	connect(m_actions.streamToggle, &QAction::triggered, this, &MenuManager::streamToggleClicked);
 	connect(m_actions.openRoom, &QAction::triggered, this, &MenuManager::openRoomClicked);

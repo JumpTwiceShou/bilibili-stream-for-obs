@@ -19,6 +19,19 @@ void expect(bool condition, const char *description)
 
 int main()
 {
+	const auto release = [](const char *tag, bool draft = false, bool prerelease = false) {
+		return json11::Json::object{{"tag_name", tag}, {"draft", draft}, {"prerelease", prerelease}};
+	};
+	expect(Core::newerReleaseVersion(release("v1.3.10"), "1.3.9") == "1.3.10" &&
+		       Core::newerReleaseVersion(release("2.0.0"), "1.9.9") == "2.0.0",
+	       "release versions are compared numerically and accept a v prefix");
+	for (const auto *tag : {"1.3.3", "1.3.4", "1.4", "2.0.0-beta.1", "2.0.0+build", "not-a-version"})
+		expect(Core::newerReleaseVersion(release(tag), "1.3.4").empty(),
+		       "same, older, malformed and suffixed tags do not prompt for an update");
+	expect(Core::newerReleaseVersion(release("2.0.0", true), "1.3.4").empty() &&
+		       Core::newerReleaseVersion(release("2.0.0", false, true), "1.3.4").empty() &&
+		       Core::newerReleaseVersion(json11::Json::object{{"tag_name", "2.0.0"}}, "1.3.4").empty(),
+	       "drafts, prereleases and incomplete release responses do not prompt");
 	int apiCode = 0;
 	expect(Core::apiResponseCode(json11::Json::object{{"code", -101}}, apiCode) && apiCode == -101,
 	       "negative API error codes are valid explicit failures");
@@ -104,6 +117,38 @@ int main()
 	expect(Core::classifyFaceAuthRetry(false, false) == Core::FaceAuthRetryDecision::Failed,
 	       "surfaces a terminal start-live failure after face authentication");
 
+	Core::FaceAuthRetryPolicy faceRetry;
+	expect(faceRetry.shouldRetry(true, true, 0), "first verified reply can immediately attempt start");
+	faceRetry.deferRetry(100);
+	expect(!faceRetry.shouldRetry(true, true, 5099) && faceRetry.shouldRetry(true, true, 5100),
+	       "persistent positive retries after five seconds without needing a pending response");
+	expect(!faceRetry.shouldRetry(false, true, 5100) && !faceRetry.shouldRetry(true, false, 5100),
+	       "query errors and unverified replies never authorize automatic start");
+	faceRetry.deferRetry(5100);
+	expect(!faceRetry.shouldRetry(true, true, 15099) && faceRetry.shouldRetry(true, true, 15100),
+	       "a second rejected attempt backs off ten seconds");
+	faceRetry.deferRetry(15100);
+	expect(!faceRetry.shouldRetry(true, true, 35099) && faceRetry.shouldRetry(true, true, 35100),
+	       "a third rejected attempt backs off twenty seconds");
+	faceRetry.deferRetry(35100);
+	expect(!faceRetry.shouldRetry(true, true, 65099) && faceRetry.shouldRetry(true, true, 65100),
+	       "start retry backoff caps at thirty seconds");
+	faceRetry.deferRetry(65100);
+	expect(!faceRetry.shouldRetry(true, true, 95099) && faceRetry.shouldRetry(true, true, 95100),
+	       "later rejected attempts keep the bounded thirty second cooldown");
+	expect(faceRetry.expired(600000) && !faceRetry.shouldRetry(true, true, 600000),
+	       "automatic retry ends at the ten minute verification deadline");
+	Core::FaceAuthRetryPolicy persistentPositive;
+	int attempts = 0;
+	for (std::int64_t elapsed = 0; elapsed <= 610000; elapsed += 1500) {
+		if (persistentPositive.shouldRetry(true, true, elapsed)) {
+			++attempts;
+			persistentPositive.deferRetry(elapsed);
+		}
+	}
+	expect(attempts > 1 && attempts <= 24,
+	       "persistent stale success cannot stall forever or issue a start on every status poll");
+
 	expect(!Core::shouldStopManagedSession(false, true, true), "does not stop an unmanaged live session");
 	expect(!Core::shouldStopManagedSession(true, true, false), "does not stop an already inactive managed session");
 	expect(Core::shouldStopManagedSession(true, true, true), "stops an active managed session");
@@ -119,6 +164,9 @@ int main()
 	       "keeps logout available when saved credentials exist but login status is unavailable");
 	const Core::ControlState busyControls = Core::controlState(true, true, true, true);
 	const auto missingRoomControls = Core::controlState(false, true, false, true);
+	expect(missingRoomControls.refreshRoomEnabled && !busyControls.refreshRoomEnabled &&
+		       !Core::controlState(false, false, false, false).refreshRoomEnabled,
+	       "manual room refresh is available with saved login even when the room is missing");
 	expect(!missingRoomControls.streamToggleEnabled && !missingRoomControls.updateRoomEnabled &&
 		       !missingRoomControls.openRoomEnabled && missingRoomControls.scanQrEnabled,
 	       "room lookup failure disables room actions while preserving login recovery");

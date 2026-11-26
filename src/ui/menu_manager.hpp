@@ -12,6 +12,7 @@ public:
 	struct Actions {
 		QAction *scanQrcode = nullptr;
 		QAction *loginStatus = nullptr;
+		QAction *refreshRoom = nullptr;
 		QAction *logout = nullptr;
 		QAction *streamToggle = nullptr;
 		QAction *openRoom = nullptr;
@@ -27,6 +28,7 @@ public:
 
 signals:
 	void scanQrcodeClicked();
+	void refreshRoomClicked();
 	void logoutClicked();
 	void streamToggleClicked();
 	void openRoomClicked();

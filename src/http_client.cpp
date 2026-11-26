@@ -95,7 +95,8 @@ int transferProgress(void *data, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
 
 HttpResponse performRequest(const std::string &url, const std::string *postData,
 			    const std::vector<std::string> &headers, long timeoutMs,
-			    const Proxy::Endpoint *explicitEndpoint = nullptr, bool loginTicket = false)
+			    const Proxy::Endpoint *explicitEndpoint = nullptr, bool loginTicket = false,
+			    bool followRedirects = true)
 {
 	HttpResponse response;
 	if (loginTicket && !Core::trustedLoginUrl(url)) {
@@ -141,7 +142,7 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeoutMs);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (std::min)(timeoutMs, 5000L));
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, loginTicket ? 0L : 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, !loginTicket && followRedirects ? 1L : 0L);
 	if (loginTicket)
 		curl_easy_setopt(curl, CURLOPT_COOKIEFILE,
 				 ""); // In-memory, domain-scoped cookies; never a cookie file.
@@ -335,5 +336,11 @@ HttpResponse HttpClient::post(const std::string &url, const std::string &data, c
 			      long timeoutMs)
 {
 	return performRequest(url, &data, headers, timeoutMs);
+}
+
+HttpResponse HttpClient::postWithoutRedirects(const std::string &url, const std::string &data,
+					     const std::vector<std::string> &headers, long timeoutMs)
+{
+	return performRequest(url, &data, headers, timeoutMs, nullptr, false, false);
 }
 } // namespace Http

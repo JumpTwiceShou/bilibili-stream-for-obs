@@ -28,5 +28,7 @@ public:
 					const std::vector<std::string> &headers = {}, long timeout_ms = 10000);
 	static HttpResponse post(const std::string &url, const std::string &data,
 				 const std::vector<std::string> &headers = {}, long timeout_ms = 10000);
+	static HttpResponse postWithoutRedirects(const std::string &url, const std::string &data,
+						const std::vector<std::string> &headers, long timeout_ms = 10000);
 };
 } // namespace Http

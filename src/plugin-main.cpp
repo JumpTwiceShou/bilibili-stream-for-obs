@@ -11,7 +11,11 @@
 #include <QSignalBlocker>
 #include <QDesktopServices>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QMetaObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QPointer>
 #include <QStringList>
 #include <QUrl>
 #include <atomic>
@@ -79,8 +83,8 @@ struct StartAttempt {
 	std::string selectedAddress;
 	std::string rtmpAddress;
 	std::string rtmpCode;
-	std::string faceUrl;
-	int faceAuthCode = 0;
+	Bili::StartLiveFollowUp followUp;
+	Bili::RealnameChallenge realname;
 	std::string message;
 };
 
@@ -88,10 +92,13 @@ StartAttempt startLive(Bili::Config config)
 {
 	StartAttempt result;
 	result.config = std::move(config);
-	std::string mid = result.config.mid;
 	result.started = Bili::BiliApi::startLive(result.config, result.rtmpAddress, result.rtmpCode, result.message,
-						  result.faceUrl, result.faceAuthCode, mid);
-	result.config.mid = mid;
+						  result.followUp);
+	if (!result.followUp.riskVoucher.empty()) {
+		Bili::BiliApi::registerRealnameChallenge(result.config, result.followUp.riskVoucher, result.realname,
+						       result.message);
+		result.followUp.riskVoucher.clear();
+	}
 	return result;
 }
 
@@ -253,7 +260,10 @@ private:
 	bool prepareProxyStream(QString &error);
 	void openLiveRoom();
 	void handleStartAttempt(StartAttempt result);
-	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode);
+	void checkForUpdateAfterStartFailure();
+	void retryStart(const Bili::Config &config);
+	void handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl, int faceAuthCode,
+				    const std::string &realnameToken = {});
 	void applyRoomChanges(const UI::RoomChanges &changes, UI::RoomApplyCallback callback);
 
 	Core::ConfigManager m_config;
@@ -268,6 +278,11 @@ private:
 	int m_stopReconnects = 0;
 	QElapsedTimer m_stopElapsed;
 	QTimer m_stopRetry;
+	QNetworkAccessManager m_releaseNetwork;
+	QPointer<QNetworkReply> m_releaseQuery;
+	QPointer<QMessageBox> m_updatePrompt;
+	QElapsedTimer m_releaseCheckElapsed;
+	QString m_notifiedRelease;
 	Core::ObsServiceGuard m_directService;
 	Proxy::Settings m_proxySettings;
 	QString m_proxyConfigPath, m_proxyCorePath;
@@ -321,6 +336,7 @@ BilibiliStreamPlugin::BilibiliStreamPlugin(QMainWindow *parent)
 	});
 	applyProxyRouting();
 	connect(m_menu, &UI::MenuManager::scanQrcodeClicked, this, &BilibiliStreamPlugin::onScanQrcode);
+	connect(m_menu, &UI::MenuManager::refreshRoomClicked, this, [this] { refreshAccountState(true); });
 	connect(m_menu, &UI::MenuManager::logoutClicked, this, &BilibiliStreamPlugin::onLogout);
 	connect(m_menu, &UI::MenuManager::streamToggleClicked, this, &BilibiliStreamPlugin::onStreamToggle);
 	connect(m_menu, &UI::MenuManager::openRoomClicked, this, &BilibiliStreamPlugin::onOpenRoom);
@@ -337,6 +353,7 @@ BilibiliStreamPlugin::BilibiliStreamPlugin(QMainWindow *parent)
 		obs_log(LOG_ERROR, "Native OBS stream button unavailable; start synchronization cannot be installed");
 	}
 	updateLoginStatus();
+	setControlsBusy(false);
 	setLiveState(false);
 	obs_frontend_add_event_callback(&BilibiliStreamPlugin::frontendEventCallback, this);
 	m_frontendCallbackRegistered = true;
@@ -356,6 +373,9 @@ BilibiliStreamPlugin::BilibiliStreamPlugin(QMainWindow *parent)
 BilibiliStreamPlugin::~BilibiliStreamPlugin()
 {
 	m_alive->store(false, std::memory_order_release);
+	if (m_releaseQuery)
+		disconnect(m_releaseQuery, nullptr, this, nullptr);
+	delete m_updatePrompt.data();
 	m_stopRetry.stop();
 	m_apiGate.reset();
 	m_directService.restore();
@@ -427,14 +447,17 @@ void BilibiliStreamPlugin::beginObsStart()
 	if (m_operationInFlight || m_stopSyncInFlight || m_shuttingDown || obs_frontend_streaming_active())
 		return;
 	if (!m_config.config().login_status) {
+		checkForUpdateAfterStartFailure();
 		UI::DialogFactory::message(UI::text("Sync.LoginRequired"), UI::text("Dialog.StartFailed"));
 		return;
 	}
 	if (m_config.config().room_id.empty()) {
+		checkForUpdateAfterStartFailure();
 		UI::DialogFactory::message(UI::text("Room.IdMissingLogin"), UI::text("Dialog.StartFailed"));
 		return;
 	}
 	if (m_proxySettings.streamEnabled() && !m_proxy->endpoint().ready()) {
+		checkForUpdateAfterStartFailure();
 		UI::DialogFactory::message(UI::text("Sync.ProxyUnavailable"), UI::text("Dialog.StartFailed"));
 		return;
 	}
@@ -455,6 +478,7 @@ void BilibiliStreamPlugin::beginObsStart()
 		    postToUi(alive,
 			     [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
 	    })) {
+		checkForUpdateAfterStartFailure();
 		m_startObsAfterPrepare = false;
 		setControlsBusy(false);
 	}
@@ -536,6 +560,8 @@ void BilibiliStreamPlugin::finishManagedStop(const StopSyncResult &result)
 
 void BilibiliStreamPlugin::refreshAccountState(bool notifyFailure)
 {
+	if (m_operationInFlight || m_stopSyncInFlight || m_shuttingDown)
+		return;
 	const Bili::Config config = m_config.config();
 	if (config.cookies.empty()) {
 		updateLoginStatus();
@@ -638,6 +664,7 @@ void BilibiliStreamPlugin::setControlsBusy(bool busy)
 	const Core::ControlState state = Core::controlState(busy || m_stopSyncInFlight, config.login_status,
 							    !config.room_id.empty(), !config.cookies.empty());
 	m_menu->actions().scanQrcode->setEnabled(state.scanQrEnabled);
+	m_menu->actions().refreshRoom->setEnabled(state.refreshRoomEnabled);
 	m_menu->actions().logout->setEnabled(state.logoutEnabled);
 	m_menu->actions().streamToggle->setEnabled(state.streamToggleEnabled);
 	m_menu->actions().updateRoomInfo->setEnabled(state.updateRoomEnabled);
@@ -772,11 +799,13 @@ void BilibiliStreamPlugin::onStreamToggle()
 		return;
 	}
 	if (m_proxySettings.streamEnabled() && !m_config.config().managed_session && !m_proxy->endpoint().ready()) {
+		checkForUpdateAfterStartFailure();
 		UI::DialogFactory::message(QStringLiteral("代理未就绪，请打开代理设置检测节点或重新保存。"),
 					   UI::text("Dialog.StartFailed"));
 		return;
 	}
 	if (obs_frontend_streaming_active() && !m_config.config().managed_session) {
+		checkForUpdateAfterStartFailure();
 		UI::DialogFactory::message(QStringLiteral("请先停止当前 OBS 推流，再通过插件准备直播。"),
 					   UI::text("Dialog.StartFailed"));
 		return;
@@ -789,6 +818,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 		    ToggleResult result = toggleLive(config);
 		    postToUi(alive, [this, result = std::move(result)]() mutable {
 			    if (!result.liveStatusKnown) {
+				    checkForUpdateAfterStartFailure();
 				    m_startObsAfterPrepare = false;
 				    setControlsBusy(false);
 				    UI::DialogFactory::message(QString::fromUtf8(result.message),
@@ -818,6 +848,7 @@ void BilibiliStreamPlugin::onStreamToggle()
 			    handleStartAttempt(std::move(result.start));
 		    });
 	    })) {
+		checkForUpdateAfterStartFailure();
 		m_startObsAfterPrepare = false;
 		setControlsBusy(false);
 	}
@@ -876,6 +907,7 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 			m_proxyKey = result.rtmpCode;
 			QString error;
 			if (!prepareProxyStream(error)) {
+				checkForUpdateAfterStartFailure();
 				m_startObsAfterPrepare = false;
 				setControlsBusy(false);
 				UI::DialogFactory::message(
@@ -895,6 +927,7 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 		setControlsBusy(false);
 		if (std::exchange(m_startObsAfterPrepare, false)) {
 			if (!m_directService.install(result.selectedAddress, result.rtmpCode)) {
+				checkForUpdateAfterStartFailure();
 				UI::DialogFactory::message(UI::text("Sync.PrepareFailed"),
 							   UI::text("Dialog.StartFailed"));
 				return;
@@ -905,10 +938,40 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 		onStreamRoutes();
 		return;
 	}
-	if (!result.faceUrl.empty() && result.faceAuthCode != 0) {
-		handleFaceAuthRequired(result.config, result.faceUrl, result.faceAuthCode);
+	auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
+	if (result.followUp.versionTimedOut) {
+		checkForUpdateAfterStartFailure();
+		if (UI::DialogFactory::confirm(QString::fromUtf8(result.message), UI::text("Face.RetryAvailable"), parent,
+					       UI::text("Face.RetryStart"))) {
+			retryStart(result.config);
+		} else {
+			m_startObsAfterPrepare = false;
+			setControlsBusy(false);
+		}
 		return;
 	}
+	if (result.followUp.faceCode == 60043) {
+		if (!result.realname.qrUrl.empty()) {
+			handleFaceAuthRequired(result.config, result.realname.qrUrl, result.followUp.faceCode,
+					       result.realname.pollToken);
+			return;
+		}
+		checkForUpdateAfterStartFailure();
+		m_startObsAfterPrepare = false;
+		setControlsBusy(false);
+		if (UI::DialogFactory::confirm(QString::fromUtf8(result.message), UI::text("Dialog.StartFailed"),
+					       parent, UI::text("Face.OpenLiveCenter"))) {
+			if (!QDesktopServices::openUrl(QUrl(QStringLiteral("https://link.bilibili.com/p/center/index"))))
+				UI::DialogFactory::message(UI::text("Face.OpenLiveCenterFailed"), UI::text("Dialog.StartFailed"),
+							   parent);
+		}
+		return;
+	}
+	if (!result.followUp.faceUrl.empty()) {
+		handleFaceAuthRequired(result.config, result.followUp.faceUrl, result.followUp.faceCode);
+		return;
+	}
+	checkForUpdateAfterStartFailure();
 	m_startObsAfterPrepare = false;
 	setControlsBusy(false);
 	unlockProxyForError(result.message);
@@ -918,21 +981,93 @@ void BilibiliStreamPlugin::handleStartAttempt(StartAttempt result)
 	UI::DialogFactory::message(QString::fromUtf8(result.message) + help, UI::text("Dialog.StartFailed"));
 }
 
+void BilibiliStreamPlugin::checkForUpdateAfterStartFailure()
+{
+	constexpr int checkIntervalMs = 60000;
+	if (m_shuttingDown || m_releaseQuery ||
+	    (m_releaseCheckElapsed.isValid() && m_releaseCheckElapsed.elapsed() < checkIntervalMs))
+		return;
+	m_releaseCheckElapsed.start();
+
+	QNetworkRequest request{
+		QUrl(QStringLiteral("https://api.github.com/repos/JumpTwiceShou/bilibili-stream-for-obs/releases/latest"))};
+	request.setRawHeader("Accept", "application/vnd.github+json");
+	request.setRawHeader("User-Agent", QByteArray("bilibili-stream-for-obs/") + PLUGIN_VERSION);
+	request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+	request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+	request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+	auto *reply = m_releaseNetwork.get(request);
+	m_releaseQuery = reply;
+	constexpr qint64 maxReplyBytes = 256 * 1024;
+	reply->setReadBufferSize(maxReplyBytes + 1);
+	connect(reply, &QNetworkReply::readyRead, reply, [reply] {
+		if (reply->bytesAvailable() > maxReplyBytes)
+			reply->abort();
+	});
+	QTimer::singleShot(5000, reply, [reply] {
+		if (reply->isRunning())
+			reply->abort();
+	});
+	connect(reply, &QNetworkReply::finished, this, [this, reply] {
+		m_releaseQuery.clear();
+		reply->deleteLater();
+		if (m_shuttingDown || reply->error() != QNetworkReply::NoError ||
+		    reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200)
+			return;
+		std::string parseError;
+		const auto release = json11::Json::parse(reply->readAll().toStdString(), parseError);
+		const auto latest = QString::fromStdString(Core::newerReleaseVersion(release, PLUGIN_VERSION));
+		if (!parseError.empty() || latest.isEmpty() || latest == m_notifiedRelease || m_updatePrompt)
+			return;
+		m_notifiedRelease = latest;
+
+		auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
+		auto *prompt = new QMessageBox(QMessageBox::Information, UI::text("Update.Title"),
+					       UI::text("Update.Available").arg(latest, QString::fromUtf8(PLUGIN_VERSION)),
+					       QMessageBox::Close, parent);
+		m_updatePrompt = prompt;
+		prompt->setWindowModality(Qt::NonModal);
+		prompt->setAttribute(Qt::WA_DeleteOnClose);
+		prompt->setAttribute(Qt::WA_ShowWithoutActivating);
+		prompt->setTextFormat(Qt::PlainText);
+		auto *download = prompt->addButton(UI::text("Update.ViewLatest"), QMessageBox::AcceptRole);
+		connect(download, &QPushButton::clicked, this, [] {
+			QDesktopServices::openUrl(
+				QUrl(QStringLiteral("https://github.com/JumpTwiceShou/bilibili-stream-for-obs/releases/latest")));
+		});
+		prompt->show();
+	});
+}
+
+void BilibiliStreamPlugin::retryStart(const Bili::Config &config)
+{
+	const auto alive = m_alive;
+	if (!enqueue([this, alive, config]() {
+		    StartAttempt result = startLive(config);
+		    postToUi(alive, [this, result = std::move(result)]() mutable { handleStartAttempt(std::move(result)); });
+	    })) {
+		StartAttempt failed;
+		failed.config = config;
+		failed.message = "后台请求队列不可用";
+		handleStartAttempt(std::move(failed));
+	}
+}
+
 void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, const std::string &faceUrl,
-						  int faceAuthCode)
+						  int faceAuthCode, const std::string &realnameToken)
 {
 	struct FaceAuthSession {
 		Bili::Config config;
-		std::string faceUrl;
 		int faceAuthCode = 0;
 		StartAttempt completedAttempt;
 		bool hasCompletedAttempt = false;
-		int lastPollState = -1;
+		std::string realnameToken;
+		Bili::FaceAuthStatus lastPollState = Bili::FaceAuthStatus::Unavailable;
 	};
 	auto session = std::make_shared<FaceAuthSession>();
 	session->config = config;
-	session->faceUrl = faceUrl;
 	session->faceAuthCode = faceAuthCode;
+	session->realnameToken = realnameToken;
 
 	auto *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
 	setControlsBusy(true);
@@ -945,25 +1080,31 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 			auto failureCallback = callback;
 			if (!enqueue([alive, session, pollConfig, pollAuthCode,
 				      callback = std::move(callback)]() mutable {
-				    bool identified = false;
-				    std::string statusMessage;
-				    const bool requestSucceeded = Bili::BiliApi::isUserIdentifiedByFaceAuth(
-					    pollConfig, pollAuthCode, identified, statusMessage);
+				    using Status = Bili::FaceAuthStatus;
+				    auto status = Status::Unavailable;
+				    if (!session->realnameToken.empty()) {
+					    status = Bili::BiliApi::queryRealnameChallenge(pollConfig, session->realnameToken);
+				    } else {
+					    bool identified = false;
+					    std::string message;
+					    if (Bili::BiliApi::isUserIdentifiedByFaceAuth(pollConfig, pollAuthCode,
+										 identified, message))
+						    status = identified ? Status::Verified : Status::Pending;
+				    }
 				    postToUi(alive, [session, pollAuthCode, callback = std::move(callback),
-						     requestSucceeded, identified,
-						     statusMessage = std::move(statusMessage)]() mutable {
-					    const int pollState = requestSucceeded ? (identified ? 2 : 1) : 0;
-					    if (session->lastPollState != pollState) {
-						    session->lastPollState = pollState;
-						    obs_log(LOG_INFO, "Room face verification: type=%d, state=%s",
-							    pollAuthCode,
-							    requestSucceeded ? (identified ? "verified" : "pending")
-									     : "unavailable");
+						     status]() mutable {
+					    if (session->lastPollState != status) {
+						    session->lastPollState = status;
+						    obs_log(LOG_INFO, "Face verification: type=%d, state=%s", pollAuthCode,
+							    status == Status::Verified ? "verified"
+							    : status == Status::Pending ? "pending"
+							    : status == Status::Expired ? "expired or rejected"
+										: "unavailable");
 					    }
-					    callback(requestSucceeded, identified, std::move(statusMessage));
+					    callback(status);
 				    });
 			    })) {
-				failureCallback(false, false, "后台请求队列不可用");
+				failureCallback(Bili::FaceAuthStatus::Unavailable);
 			}
 		},
 		[this, session](UI::DialogFactory::FaceRetryCallback callback) {
@@ -974,30 +1115,44 @@ void BilibiliStreamPlugin::handleFaceAuthRequired(const Bili::Config &config, co
 				    StartAttempt result = startLive(retryConfig);
 				    postToUi(alive, [this, callback = std::move(callback), result = std::move(result),
 						     session]() mutable {
-					    const bool faceAuthRequired = !result.faceUrl.empty() &&
-									  result.faceAuthCode != 0;
+					    if (result.followUp.versionTimedOut) {
+						    checkForUpdateAfterStartFailure();
+						    callback(Core::FaceAuthRetryDecision::VersionTimedOut, {}, result.message);
+						    return;
+					    }
+					    if (result.followUp.faceCode == 60043 ||
+						(!session->realnameToken.empty() && !result.followUp.faceUrl.empty())) {
+						    session->completedAttempt = std::move(result);
+						    session->hasCompletedAttempt = true;
+						    callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {});
+						    return;
+					    }
+					    const bool faceAuthRequired = !result.followUp.faceUrl.empty();
 					    const auto decision =
 						    Core::classifyFaceAuthRetry(result.started, faceAuthRequired);
 					    if (decision == Core::FaceAuthRetryDecision::ContinueWaiting) {
 						    session->config = result.config;
-						    session->faceUrl = result.faceUrl;
-						    session->faceAuthCode = result.faceAuthCode;
-						    callback(decision, result.faceUrl, {});
+						    session->faceAuthCode = result.followUp.faceCode;
+						    callback(decision, result.followUp.faceUrl, {});
 						    return;
 					    }
 					    unlockProxyForError(result.message);
+					    if (decision == Core::FaceAuthRetryDecision::Failed)
+						    checkForUpdateAfterStartFailure();
 					    session->completedAttempt = std::move(result);
 					    session->hasCompletedAttempt = true;
 					    callback(decision, {}, session->completedAttempt.message);
 				    });
 			    })) {
+				checkForUpdateAfterStartFailure();
 				session->completedAttempt.config = retryConfig;
 				session->completedAttempt.message = "后台请求队列不可用";
 				session->hasCompletedAttempt = true;
 				failureCallback(Core::FaceAuthRetryDecision::Failed, {},
 						session->completedAttempt.message);
 			}
-		});
+		},
+		!realnameToken.empty());
 
 	if (completed && session->hasCompletedAttempt)
 		handleStartAttempt(std::move(session->completedAttempt));

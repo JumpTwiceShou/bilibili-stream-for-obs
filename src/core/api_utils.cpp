@@ -1,5 +1,6 @@
 #include "core/api_utils.hpp"
 
+#include <QVersionNumber>
 #include <charconv>
 #include <algorithm>
 #include <cctype>
@@ -24,7 +25,43 @@ bool isUnreserved(unsigned char value)
 	return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') ||
 	       value == '-' || value == '.' || value == '_' || value == '~';
 }
+
+QVersionNumber stableVersion(const std::string &tag)
+{
+	const QString version = QString::fromStdString(!tag.empty() && tag.front() == 'v' ? tag.substr(1) : tag);
+	const auto parsed = QVersionNumber::fromString(version);
+	return parsed.segmentCount() == 3 && parsed.toString() == version ? parsed : QVersionNumber{};
+}
 } // namespace
+
+std::string newerReleaseVersion(const json11::Json &release, const std::string &installedVersion)
+{
+	const auto &draft = release["draft"];
+	const auto &prerelease = release["prerelease"];
+	if (!draft.is_bool() || draft.bool_value() || !prerelease.is_bool() || prerelease.bool_value())
+		return {};
+	const auto installed = stableVersion(installedVersion);
+	const auto latest = stableVersion(release["tag_name"].string_value());
+	return !installed.isNull() && latest > installed ? latest.toString().toStdString() : std::string{};
+}
+
+bool FaceAuthRetryPolicy::expired(std::int64_t elapsedMs) const
+{
+	return elapsedMs >= timeoutMs;
+}
+
+bool FaceAuthRetryPolicy::shouldRetry(bool querySucceeded, bool identified, std::int64_t elapsedMs) const
+{
+	return querySucceeded && identified && !expired(elapsedMs) && elapsedMs >= nextRetryAtMs;
+}
+
+void FaceAuthRetryPolicy::deferRetry(std::int64_t elapsedMs)
+{
+	// A status endpoint can stay positive before the actual start permission is ready.
+	// Retry start with backoff instead of requiring an intervening negative status.
+	nextRetryAtMs = elapsedMs + retryDelayMs;
+	retryDelayMs = std::min(retryDelayMs * 2, 30000);
+}
 
 std::string extractCookieValue(const std::string &cookies, const std::string &key)
 {
@@ -185,6 +222,7 @@ bool shouldStopManagedSession(bool managedSession, bool statusKnown, bool isLive
 ControlState controlState(bool busy, bool loggedIn, bool hasRoomId, bool hasCredentials)
 {
 	const bool roomReady = !busy && loggedIn && hasRoomId;
-	return {!busy, !busy && hasCredentials, roomReady, roomReady, roomReady};
+	const bool canUseSavedLogin = !busy && hasCredentials;
+	return {!busy, canUseSavedLogin, roomReady, roomReady, roomReady, canUseSavedLogin};
 }
 } // namespace Core

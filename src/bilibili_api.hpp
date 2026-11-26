@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <string>
 #include <vector>
+#include "core/realname_challenge.hpp"
 #include "json11/json11.hpp"
 
 namespace Bili {
@@ -35,6 +36,15 @@ struct RoomInfo {
 	int live_status = 0;
 };
 
+struct StartLiveFollowUp {
+	std::string faceUrl;
+	std::string riskVoucher;
+	int faceCode = 0;
+	bool versionTimedOut = false;
+};
+
+enum class FaceAuthStatus { Unavailable, Pending, Verified, Expired };
+
 class BiliApi {
 public:
 	enum class QrLoginResult { Pending, Scanned, Success, Expired, Error };
@@ -51,10 +61,13 @@ public:
 	static bool getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message);
 	static bool getLiveStatus(const Config &config, bool &is_live, std::string &message);
 	static json11::Json getPartitionList(std::string &message);
-	static bool startLive(Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
-			      std::string &face_qr, int &face_auth_code, std::string &mid);
+	static bool startLive(const Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
+			      StartLiveFollowUp &followUp);
 	static bool isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
 					       std::string &message);
+	static bool registerRealnameChallenge(const Config &config, const std::string &voucher, RealnameChallenge &challenge,
+					      std::string &message);
+	static FaceAuthStatus queryRealnameChallenge(const Config &config, const std::string &pollToken);
 	static bool stopLive(const Config &config, std::string &message);
 	static bool updateRoomInfo(const Config &config, const std::string &title, std::string &message);
 	static bool updateRoomArea(const Config &config, int area_id, std::string &message);

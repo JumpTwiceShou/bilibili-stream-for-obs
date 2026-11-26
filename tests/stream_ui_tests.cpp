@@ -33,7 +33,7 @@ int main(int argc, char **argv)
 			std::cerr << "FAIL: " << message << '\n';
 		}
 	};
-	QTimer::singleShot(5000, &app, [] { std::exit(2); });
+	QTimer::singleShot(15000, &app, [] { std::exit(2); });
 	QPushButton button;
 	button.resize(150, 40);
 	bool enabled = true;
@@ -65,6 +65,52 @@ int main(int argc, char **argv)
 	QApplication::sendEvent(&pill, &key);
 	check(pill.isChecked(), "pill retains checkbox keyboard accessibility");
 
+	using FaceStatus = Bili::FaceAuthStatus;
+	int stablePolls = 0, stableRetries = 0;
+	QString waitingStatus, waitingDetail;
+	const bool stableWaiting = UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face",
+		[&](auto callback) {
+			auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			auto *status = dialog->findChild<QLabel *>("faceWaitingStatus");
+			auto *detail = dialog->findChild<QLabel *>("faceWaitingDetail");
+			if (++stablePolls == 1) {
+				waitingStatus = status->text();
+				waitingDetail = detail->text();
+				check(waitingStatus == "Face.Waiting" && waitingDetail == "Face.WaitingHint",
+				      "both waiting labels provide guidance from the initial frame");
+				auto timers = dialog->findChildren<QTimer *>();
+				check(timers.size() == 1 && timers.front()->interval() == 1500,
+				      "face status polling retains its 1.5 second interval");
+				for (auto *timer : timers)
+					timer->setInterval(1);
+			}
+			// Query errors, pending responses and rejected automatic starts must not change waiting text.
+			callback(stablePolls % 3 == 0   ? FaceStatus::Verified
+				 : stablePolls % 3 == 1 ? FaceStatus::Unavailable
+							: FaceStatus::Pending);
+			check(status->text() == waitingStatus && detail->text() == waitingDetail,
+			      "all waiting text remains stable across status errors, pending and rejected starts");
+			if (stablePolls == 6)
+				dialog->reject();
+		},
+		[&](auto callback) {
+			++stableRetries;
+			callback(Core::FaceAuthRetryDecision::ContinueWaiting, {}, {});
+		});
+	check(!stableWaiting && stableRetries == 1,
+	      "stable guidance preserves the retry cooldown even when status rapidly alternates");
+	UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face", [](auto callback) { callback(FaceStatus::Verified); },
+		[&](auto callback) {
+			callback(Core::FaceAuthRetryDecision::Failed, {}, "fixture terminal error");
+			auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			check(dialog->findChild<QLabel *>("faceWaitingStatus")->text() == "Dialog.StartFailed" &&
+				      dialog->findChild<QLabel *>("faceWaitingDetail")->text() == "fixture terminal error",
+			      "terminal failures replace waiting guidance with the actionable error");
+			dialog->reject();
+		});
+
 	auto speedUp = [&] {
 		QTimer::singleShot(0, &app, [] {
 			auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
@@ -72,6 +118,36 @@ int main(int argc, char **argv)
 				timer->setInterval(1);
 		});
 	};
+	int timeoutAttempts = 0;
+	speedUp();
+	const bool recovered = UI::DialogFactory::faceAuth(
+		nullptr, "https://fixture.example/face", [](auto callback) { callback(FaceStatus::Verified); },
+		[&](auto callback) {
+			if (++timeoutAttempts != 1) {
+				callback(Core::FaceAuthRetryDecision::Started, {}, {});
+				return;
+			}
+			callback(Core::FaceAuthRetryDecision::VersionTimedOut, {}, "fixture version timeout");
+			auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			QTimer::singleShot(30, dialog, [&, dialog] {
+				QPushButton *retry = nullptr;
+				for (auto *button : dialog->findChildren<QPushButton *>())
+					if (button->text() == "Face.ManualRetry")
+						retry = button;
+				check(timeoutAttempts == 1 && retry && retry->isEnabled() &&
+					      dialog->findChild<QLabel *>("faceWaitingDetail")->text() == "fixture version timeout",
+				      "version GET timeout leaves a manual retry enabled without triggering more automatic starts");
+				if (retry && retry->isEnabled())
+					retry->click();
+				else
+					dialog->reject();
+			});
+		});
+	check(recovered && timeoutAttempts == 2, "manual retry completes in the original face dialog");
+	check(UI::DialogFactory::faceAuth(
+		      nullptr, "https://fixture.example/face", [](auto callback) { callback(FaceStatus::Verified); },
+		      [](auto callback) { callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {}); }),
+	      "a different authentication challenge closes the room dialog for the official flow");
 	int polls = 0, retries = 0;
 	speedUp();
 	const bool staleCompleted = UI::DialogFactory::faceAuth(
@@ -83,7 +159,7 @@ int main(int argc, char **argv)
 			for (auto *label : dialog->findChildren<QLabel *>())
 				stable |= label->text() == "Face.Waiting";
 			check(stable, "face main status stays stable");
-			callback(true, true, "changing server status");
+			callback(FaceStatus::Verified);
 			if (polls == 10)
 				dialog->reject();
 		},
@@ -91,14 +167,16 @@ int main(int argc, char **argv)
 			++retries;
 			callback(Core::FaceAuthRetryDecision::ContinueWaiting, {}, {});
 		});
-	check(!staleCompleted && retries == 1, "stale face success never causes repeated starts");
+	check(!staleCompleted && retries == 1, "stale face success cannot repeat starts on every poll");
 	polls = retries = 0;
 	speedUp();
 	const bool completed = UI::DialogFactory::faceAuth(
 		nullptr, "https://fixture.example/face",
 		[&](auto callback) {
 			++polls;
-			callback(true, polls != 2, {});
+			// Reproduce the live failure: early verified, a query failure, then verified forever.
+			// The endpoint never returns pending after the first rejected start.
+			callback(polls == 2 ? FaceStatus::Unavailable : FaceStatus::Verified);
 		},
 		[&](auto callback) {
 			++retries;
@@ -106,14 +184,14 @@ int main(int argc, char **argv)
 					      : Core::FaceAuthRetryDecision::Started,
 				 {}, {});
 		});
-	check(completed && retries == 2 && polls == 3,
-	      "a single success immediately retries; pending rearms a stale result");
+	check(completed && retries == 2 && polls > 3,
+	      "early positive followed by rejected start resumes automatically after cooldown without manual input");
 	polls = retries = 0;
 	const bool firstPositive = UI::DialogFactory::faceAuth(
 		nullptr, "https://fixture.example/face",
 		[&](auto callback) {
 			++polls;
-			callback(true, true, {});
+			callback(FaceStatus::Verified);
 		},
 		[&](auto callback) {
 			++retries;
@@ -135,7 +213,12 @@ int main(int argc, char **argv)
 			for (auto *label : dialog->findChildren<QLabel *>())
 				hasQr |= !label->pixmap().isNull();
 			check(hasQr, "native face dialog renders a QR without an embedded browser");
-			callback(true, ++changedPolls != 2, {});
+			callback(++changedPolls == 2 ? FaceStatus::Pending : FaceStatus::Verified);
+			if (changedPolls == 2) {
+				for (auto *candidate : dialog->findChildren<QPushButton *>())
+					if (candidate->text() == "Face.ManualRetry")
+						candidate->click();
+			}
 		},
 		[&](auto callback) {
 			callback(++changedRetries == 1 ? Core::FaceAuthRetryDecision::ContinueWaiting
@@ -143,7 +226,8 @@ int main(int argc, char **argv)
 				 "https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=42",
 				 {});
 		});
-	check(refreshed && changedRetries == 2, "replacement QR waits for confirmed start in the same dialog");
+	check(refreshed && changedRetries == 2,
+	      "manual retry bypasses automatic cooldown and replacement QR keeps the same dialog until actual start");
 	UI::DialogFactory::FacePollCallback late;
 	speedUp();
 	UI::DialogFactory::faceAuth(
@@ -153,8 +237,73 @@ int main(int argc, char **argv)
 			qobject_cast<QDialog *>(QApplication::activeModalWidget())->reject();
 		},
 		[](auto) {});
-	late(true, true, {});
+	late(FaceStatus::Verified);
 	check(true, "late response after cancel is harmless");
+	const std::string realnameQr = "https://www.bilibili.com/h5/risk-control/realname?t=" + std::string(250, 'a');
+	const auto manualRetry = [](QDialog *dialog) -> QPushButton * {
+		for (auto *button : dialog->findChildren<QPushButton *>())
+			if (button->text() == "Face.ManualRetry")
+				return button;
+		return nullptr;
+	};
+	int realnamePolls = 0;
+	int realnameStarts = 0;
+	speedUp();
+	check(UI::DialogFactory::faceAuth(
+		      nullptr, realnameQr,
+		      [&](auto callback) {
+			      auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			      auto *button = manualRetry(dialog);
+			      check(button && !button->isEnabled() && realnameStarts == 0,
+				    "realname cannot request a start while confirmation is pending");
+			      bool hasFittingQr = false;
+			      for (auto *label : dialog->findChildren<QLabel *>())
+				      hasFittingQr |= !label->pixmap().isNull() && label->pixmap().width() <= 480;
+			      check(hasFittingQr, "realname fits a long official QR into the native dialog");
+			      callback(++realnamePolls == 1 ? FaceStatus::Pending : FaceStatus::Verified);
+		      },
+		      [&](auto callback) {
+			      if (++realnameStarts == 2) {
+				      callback(Core::FaceAuthRetryDecision::Started, {}, {});
+				      return;
+			      }
+			      callback(Core::FaceAuthRetryDecision::VersionTimedOut, {}, "fixture version timeout");
+			      auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			      QTimer::singleShot(30, dialog, [&, dialog] {
+				      auto *button = manualRetry(dialog);
+				      check(realnamePolls == 2 && realnameStarts == 1 && button && button->isEnabled(),
+					    "verified realname stops polling and keeps manual retry after the version timeout");
+				      if (button && button->isEnabled())
+					      button->click();
+				      else
+					      dialog->reject();
+			      });
+		      },
+		      true) && realnameStarts == 2,
+	      "realname resumes through the existing start dialog after confirmation and one manual retry");
+	realnamePolls = 0;
+	speedUp();
+	check(!UI::DialogFactory::faceAuth(
+		      nullptr, realnameQr,
+		      [&](auto callback) {
+			      auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+			      if (++realnamePolls > 1) {
+				      dialog->reject();
+				      return;
+			      }
+			      callback(FaceStatus::Expired);
+			      QTimer::singleShot(30, dialog, [&, dialog] {
+				      auto *button = manualRetry(dialog);
+				      check(button && !button->isEnabled() &&
+						    dialog->findChild<QLabel *>("faceWaitingStatus")->text() ==
+							    "Face.ChallengeExpired",
+					    "expired realname disables start and asks for a fresh QR");
+				      dialog->reject();
+			      });
+		      },
+		      [&](auto) { check(false, "expired realname must not request a start"); }, true) &&
+		      realnamePolls == 1,
+	      "realname expiration stops status polling");
 	Core::StreamRoutes routes{{"Bilibili response", "rtmp://api.example/live", 100},
 				  {"OBS overseas", "rtmp://overseas.example/live", 30}};
 	int applied = 0;
