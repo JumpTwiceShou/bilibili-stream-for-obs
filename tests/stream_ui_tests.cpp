@@ -148,6 +148,16 @@ int main(int argc, char **argv)
 		      nullptr, "https://fixture.example/face", [](auto callback) { callback(FaceStatus::Verified); },
 		      [](auto callback) { callback(Core::FaceAuthRetryDecision::ChallengeChanged, {}, {}); }),
 	      "a different authentication challenge closes the room dialog for the official flow");
+	int expiredLoginStarts = 0;
+	check(UI::DialogFactory::faceAuth(
+		      nullptr, "https://fixture.example/face",
+		      [](auto callback) { callback(FaceStatus::LoginRequired); },
+		      [&](auto) { ++expiredLoginStarts; }, true) && expiredLoginStarts == 0,
+	      "login expiry during verification closes the dialog without retrying start");
+	check(UI::DialogFactory::faceAuth(
+		      nullptr, "https://fixture.example/face", [](auto callback) { callback(FaceStatus::Verified); },
+		      [](auto callback) { callback(Core::FaceAuthRetryDecision::LoginRequired, {}, {}); }),
+	      "login expiry after a face scan closes the face dialog for the login prompt");
 	int polls = 0, retries = 0;
 	speedUp();
 	const bool staleCompleted = UI::DialogFactory::faceAuth(

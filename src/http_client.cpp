@@ -4,8 +4,10 @@
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string_view>
@@ -35,6 +37,14 @@ bool initialized = false;
 std::mutex proxyMutex;
 bool proxyRequired = false;
 Proxy::Endpoint proxyEndpoint;
+std::uint64_t proxyRevision = 0;
+
+using CurlHandle = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
+struct ReadConnections {
+	CurlHandle handle{nullptr, curl_easy_cleanup};
+	std::uint64_t revision = 0;
+};
+thread_local ReadConnections *jobReads = nullptr;
 
 size_t writeCallback(void *contents, size_t size, size_t count, void *userData)
 {
@@ -105,6 +115,7 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 	}
 	bool useProxy;
 	Proxy::Endpoint endpoint;
+	std::uint64_t revision = 0;
 	if (explicitEndpoint) {
 		useProxy = true;
 		endpoint = *explicitEndpoint;
@@ -112,12 +123,23 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 		std::lock_guard<std::mutex> lock(proxyMutex);
 		useProxy = proxyRequired;
 		endpoint = proxyEndpoint;
+		revision = proxyRevision;
 	}
 	if (useProxy && !endpoint.ready()) {
 		response.data = "代理未就绪；已阻止 B 站接口直连，请检查代理设置。";
 		return response;
 	}
-	CURL *curl = curl_easy_init();
+	// Reuse read connections within one job and route. Ticket exchanges keep a private cookie jar.
+	const bool reuse = jobReads && !postData && !explicitEndpoint && !loginTicket;
+	CurlHandle singleRequest{nullptr, curl_easy_cleanup};
+	auto &handle = reuse ? jobReads->handle : singleRequest;
+	if (reuse && jobReads->revision != revision) {
+		handle.reset();
+		jobReads->revision = revision;
+	}
+	if (!handle)
+		handle.reset(curl_easy_init());
+	CURL *curl = handle.get();
 	if (!curl) {
 		response.data = "CURL 初始化失败";
 		return response;
@@ -230,8 +252,11 @@ HttpResponse performRequest(const std::string &url, const std::string *postData,
 		response.cookies = std::move(responseCookies);
 	}
 
+	if (reuse && result == CURLE_OK)
+		curl_easy_reset(curl);
+	else
+		handle.reset();
 	curl_slist_free_all(headerList);
-	curl_easy_cleanup(curl);
 	return response;
 }
 
@@ -247,6 +272,8 @@ void workerLoop()
 			task = std::move(taskQueue.front());
 			taskQueue.pop();
 		}
+		ReadConnections reads;
+		jobReads = &reads;
 		try {
 			task();
 		} catch (const std::exception &error) {
@@ -254,6 +281,7 @@ void workerLoop()
 		} catch (...) {
 			obs_log(LOG_ERROR, "Unhandled background task failure");
 		}
+		jobReads = nullptr;
 	}
 }
 } // namespace
@@ -263,6 +291,7 @@ void HttpClient::setProxy(bool required, const Proxy::Endpoint &endpoint)
 	std::lock_guard<std::mutex> lock(proxyMutex);
 	proxyRequired = required;
 	proxyEndpoint = endpoint;
+	++proxyRevision;
 }
 
 bool HttpClient::init()

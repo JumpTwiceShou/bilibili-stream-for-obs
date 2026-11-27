@@ -155,6 +155,23 @@ bool apiResponseCode(const json11::Json &response, int &code)
 	return response.is_object() && jsonInteger(response["code"], code, std::numeric_limits<int>::min());
 }
 
+bool apiLoginRequired(const json11::Json &response, int code)
+{
+	if (code == -101)
+		return true;
+	if (code == 0 || code == 60024 || code == 60028 || code == 60043)
+		return false;
+	for (const auto *field : {"message", "msg"}) {
+		const auto detail = trim(response[field].string_value());
+		for (const auto *value : {"未登录", "账号未登录", "用户未登录", "请先登录", "登录已过期", "登录过期",
+					  "登录已失效", "登录失效"}) {
+			if (detail == value)
+				return true;
+		}
+	}
+	return false;
+}
+
 std::string apiErrorMessage(const json11::Json &response, const std::string &action)
 {
 	std::string detail;

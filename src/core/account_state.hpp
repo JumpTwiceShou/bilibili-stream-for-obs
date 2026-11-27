@@ -12,7 +12,9 @@ struct AccountResult {
 	std::string message;
 };
 std::string accountIdentity(const Bili::Config &config);
+bool restoreSavedAccount(Bili::Config &config);
 Bili::Config prepareAccountLogin(const Bili::Config &previous, const std::string &cookies);
+AccountResult expiredAccount(Bili::Config config, std::string message);
 AccountResult queryAccountState(Bili::Config config);
 enum class AccountApplyDecision { Applied, Failed, ManagedAccountChange };
 AccountApplyDecision applyAccountRefresh(Bili::Config &current, const AccountResult &result, bool candidateLogin);

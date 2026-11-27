@@ -39,9 +39,13 @@ plugin1 adds a managed-session ownership gate to this reference behavior so an u
 
 This repo should use plugin2 only as behavioral reference, not as copied source.
 
-## Native QR verification (1.3.3)
+## Native QR verification
 
-Face verification uses the native QR dialog. Codes 60024/60028 render the server-returned QR; 60043 restores the earlier face-middle entry with the encoded account ID. The legacy status request preserves the original code and polls every 1.5 seconds. The main label stays stable while waiting. One explicit success response permits an automatic start attempt. If start-live still requires verification, the same positive status cannot repeatedly trigger start requests; a new pending-to-success transition rearms automatic start. **Verification completed — retry start** provides a fallback for stale/inconsistent status. Status failures continue polling without guessing success. Waiting expires after ten minutes. Cancelled dialogs ignore late responses, and an in-flight start request must finish before closing. The embedded SDK/WebView2 flow was removed in 1.3.3 after a blank-window regression. QR display does not establish successful verification; actual start success and valid streaming credentials are still required. See docs/face-auth-contract.md for compatibility and validation limits.
+Face verification uses the native QR dialog. Codes 60024 and 60028 render the server-returned QR. Code 60043 registers the current challenge to obtain its mobile QR and status token. A successful start response with valid streaming credentials is required before OBS starts output. See [face verification behavior](face-auth-contract.md) for the polling and retry rules.
+
+## Restoring a saved login
+
+OBS restores the saved sign-in and room locally when the persisted account matches the cookie account and the room ID and required credentials are available. **Refresh login and live room** runs a fresh account check when requested. The start action takes the category and live state from one room response. Explicit sign-in rejection offers a new login QR, while network errors preserve the saved credentials.
 
 ## Plugin start and route dialog
 

@@ -1,6 +1,6 @@
-# Face verification behavior, updated 2026-11-26
+# Face verification behavior, updated 2026-11-27
 
-Version 1.3.4 uses the native Qt QR dialog for a `realname` challenge from code 60043. The server confirms the scan through the current challenge's status endpoint.
+Version 1.3.5 uses the native Qt QR dialog for a `realname` challenge from code 60043. The server confirms the scan through the current challenge's status endpoint.
 
 ## Bilibili Live Center
 
@@ -22,5 +22,6 @@ The loader fetches its logic and resources from the [official risk config](https
 - For 60043, the API worker registers the current `v_voucher` on Bilibili's `/x/gaia-vgate/v2/register` endpoint and decodes the response as implemented by StartLive 1.4.0. A `realname` challenge produces a mobile Bilibili QR and a polling token. The `validatePreCheck` poll runs through the same configured API route. [Registration worker](https://github.com/Radekyspec/StartLive/blob/1.4.0/startlive/core/workers/face_auth/face_captcha.py) · [Polling worker](https://github.com/Radekyspec/StartLive/blob/1.4.0/startlive/core/workers/face_auth/face_auth.py)
 - A numeric status of 1 confirms verification and triggers a fresh start request. Status 0 keeps the QR waiting. Statuses 2 and higher stop polling and prompt the user to get a new QR. Other challenge types, missing vouchers, and registration failures offer the official Live Center.
 - Each retry fetches the server-reported Windows livestream client version. A version lookup timeout retains manual retry in the same window. If a fresh start returns another challenge, the plugin uses the new challenge. OBS output requires a successful start reply with valid stream credentials.
+- An explicit signed-out or expired-login API reply closes the verification window and offers a fresh login QR. Challenge expiration and transport errors remain part of the verification flow.
 
 API and Qt fixtures cover the voucher codec, pending status, confirmation, expiration, other challenge types, and manual retry after version timeout. Confirm the live account's scan and subsequent start in OBS separately.

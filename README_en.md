@@ -4,8 +4,10 @@ This is an OBS Studio plugin for Bilibili live streaming. It supports QR-code lo
 
 The first public release of this repository is `1.0.0`. The basic workflow follows [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream), with additional behavior inspired by [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live).
 
-## Changes in 1.3.4
+## Changes in 1.3.5
 
+- Restore the saved Bilibili account and room at OBS startup so the start action is available immediately.
+- Read the room status and category together before starting. Offer QR sign-in when Bilibili reports that the session expired or requires sign-in.
 - Show the current Bilibili identity verification QR in the native window and retry the start when Bilibili confirms verification.
 - Keep manual retry available after a livestream version lookup times out. The login menu can refresh login and room status.
 - Check for plugin updates in the background after a failed stream start and offer a link to the latest release when an update is available.

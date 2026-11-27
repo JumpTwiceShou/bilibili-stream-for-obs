@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <string>
 #include <vector>
 #include "core/realname_challenge.hpp"
@@ -33,7 +33,7 @@ struct RoomInfo {
 	std::string area_name;
 	int part_id = 0;
 	int area_id = 0;
-	int live_status = 0;
+	int live_status = -1;
 };
 
 struct StartLiveFollowUp {
@@ -41,9 +41,10 @@ struct StartLiveFollowUp {
 	std::string riskVoucher;
 	int faceCode = 0;
 	bool versionTimedOut = false;
+	bool loginRequired = false;
 };
 
-enum class FaceAuthStatus { Unavailable, Pending, Verified, Expired };
+enum class FaceAuthStatus { Unavailable, Pending, Verified, Expired, LoginRequired };
 
 class BiliApi {
 public:
@@ -58,15 +59,17 @@ public:
 				     std::string &mid);
 	static bool getRoomIdAndCsrf(const std::string &cookies, std::string &room_id, std::string &csrf_token,
 				     std::string &message);
-	static bool getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message);
-	static bool getLiveStatus(const Config &config, bool &is_live, std::string &message);
+	static bool getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message,
+				       bool *loginRequired = nullptr);
+	static bool getLiveStatus(const Config &config, bool &is_live, std::string &message,
+				  std::string *roomId = nullptr);
 	static json11::Json getPartitionList(std::string &message);
 	static bool startLive(const Config &config, std::string &rtmp_addr, std::string &rtmp_code, std::string &message,
 			      StartLiveFollowUp &followUp);
 	static bool isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
-					       std::string &message);
+					       std::string &message, bool *loginRequired = nullptr);
 	static bool registerRealnameChallenge(const Config &config, const std::string &voucher, RealnameChallenge &challenge,
-					      std::string &message);
+					      std::string &message, bool *loginRequired = nullptr);
 	static FaceAuthStatus queryRealnameChallenge(const Config &config, const std::string &pollToken);
 	static bool stopLive(const Config &config, std::string &message);
 	static bool updateRoomInfo(const Config &config, const std::string &title, std::string &message);

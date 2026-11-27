@@ -1,4 +1,4 @@
-﻿#include "bilibili_api.hpp"
+#include "bilibili_api.hpp"
 #include "core/api_utils.hpp"
 #include "core/login_utils.hpp"
 #include "http_client.hpp"
@@ -48,7 +48,7 @@ bool requireSuccessfulResponse(const Http::HttpResponse &response, const char *a
 }
 
 bool readApiReply(const Http::HttpResponse &response, const char *action, json11::Json &json, std::string &message,
-		  int *responseCode = nullptr)
+		  int *responseCode = nullptr, bool *loginRequired = nullptr)
 {
 	std::string error;
 	json = json11::Json::parse(response.data, error);
@@ -57,6 +57,8 @@ bool readApiReply(const Http::HttpResponse &response, const char *action, json11
 		message = std::string(action) + "失败: 响应不是有效的 API 数据";
 		return false;
 	}
+	if (loginRequired)
+		*loginRequired = Core::apiLoginRequired(json, code);
 	if (responseCode) {
 		*responseCode = code;
 	} else if (code != 0) {
@@ -210,7 +212,8 @@ bool BiliApi::checkLoginStatus(const std::string &cookies, bool &is_logged_in, s
 	std::string parseError;
 	const auto statusReply = json11::Json::parse(response.data, parseError);
 	int statusCode = 0;
-	if (parseError.empty() && Core::apiResponseCode(statusReply, statusCode) && statusCode == -101) {
+	if (parseError.empty() && Core::apiResponseCode(statusReply, statusCode) &&
+	    Core::apiLoginRequired(statusReply, statusCode)) {
 		mid.clear();
 		message = "Bilibili 登录已失效，请重新扫码登录";
 		return true;
@@ -291,8 +294,11 @@ bool BiliApi::getRoomIdAndCsrf(const std::string &cookies, std::string &room_id,
 	return true;
 }
 
-bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message)
+bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std::string &message, bool *loginRequired)
 {
+	room_info.live_status = -1;
+	if (loginRequired)
+		*loginRequired = false;
 	if (config.room_id.empty()) {
 		message = "无法获取当前直播间信息: room_id 为空";
 		return false;
@@ -308,7 +314,7 @@ bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std:
 	}
 
 	json11::Json json;
-	if (!readApiReply(response, "获取当前直播间信息", json, message)) {
+	if (!readApiReply(response, "获取当前直播间信息", json, message, nullptr, loginRequired)) {
 		return false;
 	}
 
@@ -324,6 +330,14 @@ bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std:
 		message = "获取当前直播间信息失败: 返回数据为空";
 		return false;
 	}
+	const auto &owner = room_json["uid"];
+	const double ownerId = owner.number_value();
+	if (!config.mid.empty() && owner.is_number() && std::isfinite(ownerId) && std::floor(ownerId) == ownerId &&
+	    ownerId > 0 && ownerId <= 9007199254740991.0 &&
+	    std::to_string(static_cast<long long>(ownerId)) != config.mid) {
+		message = "保存的直播间与当前账号不一致，请刷新直播间信息";
+		return false;
+	}
 
 	room_info.room_id = config.room_id;
 	room_info.title = room_json["title"].string_value();
@@ -331,15 +345,21 @@ bool BiliApi::getCurrentRoomInfo(const Config &config, RoomInfo &room_info, std:
 	room_info.area_id = room_json["area_id"].int_value();
 	room_info.parent_area_name = room_json["parent_area_name"].string_value();
 	room_info.area_name = room_json["area_name"].string_value();
-	room_info.live_status = room_json["live_status"].int_value();
+	int returnedRoomId = 0, status = -1;
+	if (Core::jsonInteger(room_json["room_id"], returnedRoomId, 1) &&
+	    std::to_string(returnedRoomId) == config.room_id &&
+	    Core::jsonInteger(room_json["live_status"], status) && status <= 2)
+		room_info.live_status = status;
 
 	message = "获取当前直播间信息成功";
 	return true;
 }
 
-bool BiliApi::getLiveStatus(const Config &config, bool &is_live, std::string &message)
+bool BiliApi::getLiveStatus(const Config &config, bool &is_live, std::string &message, std::string *roomId)
 {
 	is_live = false;
+	if (roomId)
+		roomId->clear();
 	std::string mid = config.mid;
 	if (mid.empty()) {
 		mid = Core::extractCookieValue(config.cookies, "DedeUserID");
@@ -370,6 +390,9 @@ bool BiliApi::getLiveStatus(const Config &config, bool &is_live, std::string &me
 	}
 
 	is_live = status == 1;
+	int returnedRoomId = 0;
+	if (roomId && Core::jsonInteger(json["data"]["roomid"], returnedRoomId, 1))
+		*roomId = std::to_string(returnedRoomId);
 	message = is_live ? "当前直播状态: 直播中" : "当前直播状态: 未开播";
 	obs_log(LOG_INFO, "%s", message.c_str());
 	return true;
@@ -401,7 +424,7 @@ bool BiliApi::startLive(const Config &config, std::string &rtmp_addr, std::strin
 	rtmp_code.clear();
 	if (config.room_id.empty() || config.csrf_token.empty()) {
 		obs_log(LOG_ERROR, "Start-live configuration is incomplete");
-		message = "开播配置无效，请重新登录并更新直播间信息";
+		message = "开播配置不完整，请刷新直播间信息";
 		return false;
 	}
 
@@ -420,7 +443,7 @@ bool BiliApi::startLive(const Config &config, std::string &rtmp_addr, std::strin
 	}
 
 	json11::Json json;
-	if (!readApiReply(version_response, "获取直播版本信息", json, message)) {
+	if (!readApiReply(version_response, "获取直播版本信息", json, message, nullptr, &followUp.loginRequired)) {
 		return false;
 	}
 
@@ -450,13 +473,13 @@ bool BiliApi::startLive(const Config &config, std::string &rtmp_addr, std::strin
 	}
 
 	int code = 0;
-	if (!readApiReply(response, "启动直播", json, message, &code)) {
+	if (!readApiReply(response, "启动直播", json, message, &code, &followUp.loginRequired)) {
 		return false;
 	}
 	if (code != 0) {
 		message = Core::apiErrorMessage(json, "启动直播");
 		// Preserve the actionable restriction message before classifying numeric face-auth codes.
-		if (Core::isIpFollowerRestriction(message))
+		if (followUp.loginRequired || Core::isIpFollowerRestriction(message))
 			return false;
 
 		if (code == 60024 || code == 60028) {
@@ -488,9 +511,11 @@ bool BiliApi::startLive(const Config &config, std::string &rtmp_addr, std::strin
 }
 
 bool BiliApi::registerRealnameChallenge(const Config &config, const std::string &voucher,
-					 RealnameChallenge &challenge, std::string &message)
+					 RealnameChallenge &challenge, std::string &message, bool *loginRequired)
 {
 	challenge = {};
+	if (loginRequired)
+		*loginRequired = false;
 	if (config.cookies.empty() || config.csrf_token.empty() || voucher.empty() || voucher.size() > 4096) {
 		message = "启动官方人脸验证失败：缺少登录信息或有效的验证凭证";
 		return false;
@@ -500,7 +525,8 @@ bool BiliApi::registerRealnameChallenge(const Config &config, const std::string 
 								form, buildHeaders(config.cookies));
 	json11::Json json;
 	constexpr auto action = "获取官方人脸验证二维码";
-	if (!requireSuccessfulResponse(reply, action, message) || !readApiReply(reply, action, json, message))
+	if (!requireSuccessfulResponse(reply, action, message) ||
+	    !readApiReply(reply, action, json, message, nullptr, loginRequired))
 		return false;
 	switch (decodeRealnameChallenge(voucher, json["data"]["content"].string_value(), challenge)) {
 	case RealnameDecodeResult::Ready:
@@ -530,8 +556,10 @@ FaceAuthStatus BiliApi::queryRealnameChallenge(const Config &config, const std::
 	constexpr auto action = "查询官方人脸验证状态";
 	std::string message;
 	json11::Json json;
-	if (!requireSuccessfulResponse(reply, action, message) || !readApiReply(reply, action, json, message))
-		return FaceAuthStatus::Unavailable;
+	bool loginRequired = false;
+	if (!requireSuccessfulResponse(reply, action, message) ||
+	    !readApiReply(reply, action, json, message, nullptr, &loginRequired))
+		return loginRequired ? FaceAuthStatus::LoginRequired : FaceAuthStatus::Unavailable;
 	const auto &value = json["data"]["status"];
 	int status = 0;
 	if (!value.is_number() || !Core::jsonInteger(value, status))
@@ -542,9 +570,11 @@ FaceAuthStatus BiliApi::queryRealnameChallenge(const Config &config, const std::
 }
 
 bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_code, bool &is_identified,
-					 std::string &message)
+					 std::string &message, bool *loginRequired)
 {
 	is_identified = false;
+	if (loginRequired)
+		*loginRequired = false;
 	if (config.room_id.empty() || config.csrf_token.empty() ||
 	    (face_auth_code != 60024 && face_auth_code != 60028)) {
 		message = "查询人脸认证状态失败: 配置或认证类型无效";
@@ -563,7 +593,7 @@ bool BiliApi::isUserIdentifiedByFaceAuth(const Config &config, int face_auth_cod
 	}
 
 	json11::Json json;
-	if (!readApiReply(response, "查询人脸认证状态", json, message)) {
+	if (!readApiReply(response, "查询人脸认证状态", json, message, nullptr, loginRequired)) {
 		return false;
 	}
 

@@ -157,7 +157,7 @@ int main(int argc, char **argv)
 	      "new-anchor room verification follows the official 60028 flow");
 	reset({version, reply(R"({"code":60043,"data":{"risk_extra":{"v_voucher":"fixture-voucher"}}})")});
 	check(!start() && followUp.faceUrl.empty() && followUp.riskVoucher == "fixture-voucher" &&
-		      followUp.faceCode == 60043 && address.empty() && key.empty(),
+		      followUp.faceCode == 60043 && !followUp.loginRequired && address.empty() && key.empty(),
 	      "60043 hands the official voucher to the caller without starting or using the room QR path");
 	reset({version, reply(R"({"code":60043,"data":{}})")});
 	check(!start() && followUp.riskVoucher.empty() && followUp.faceUrl.empty() &&
@@ -219,7 +219,7 @@ int main(int argc, char **argv)
 		     {R"({"code":0,"data":{"status":"1"}})", Status::Unavailable},
 		     {R"({"code":0,"data":{"status":true}})", Status::Unavailable},
 		     {R"({"code":0,"data":{}})", Status::Unavailable},
-		     {R"({"code":-101,"data":{"status":1}})", Status::Unavailable}}) {
+		     {R"({"code":-101,"data":{"status":1}})", Status::LoginRequired}}) {
 		reset({reply(response)});
 		check(Api::queryRealnameChallenge(config, realname.pollToken) == status && requests.size() == 1 &&
 			      requests.back().method == "POST-no-redirect" &&
@@ -227,7 +227,7 @@ int main(int argc, char **argv)
 			      requests.back().body == "token=" + Core::encodeFormComponent(realname.pollToken) +
 								"&dm_track=%7B%22dm_img_list%22%3A%5B%5D%7D"
 								"&csrf=fixture-csrf",
-		      "only the current challenge status 1 can verify a scan");
+		      "the poll distinguishes verification, challenge expiry and account expiry");
 	}
 	reset({registration(otherTypeContent)});
 	check(!Api::registerRealnameChallenge(config, "fixture-voucher", realname, message) &&
@@ -241,12 +241,32 @@ int main(int argc, char **argv)
 	const auto started = reply(R"({"code":0,"data":{"rtmp":{"addr":"rtmp://fixture/live","code":"fixture-key"}}})");
 	Http::HttpResponse timedOut;
 	timedOut.timeout = true;
+	const auto signInRequired = reply(R"({"code":-101,"message":"账号未登录"})");
+	reset({signInRequired});
+	check(!start() && followUp.loginRequired && requests.size() == 1,
+	      "an explicit login failure in the version request prevents submitting start");
+	reset({version, signInRequired});
+	check(!start() && followUp.loginRequired && requests.size() == 2 && address.empty() && key.empty(),
+	      "only an explicit start reply can mark the saved account signed out");
+	reset({version, reply(R"({"code":-400,"msg":"登录已过期"})")});
+	check(!start() && followUp.loginRequired, "an explicit expiry message can require login");
+	reset({version, reply(R"({"code":-111,"message":"csrf 校验失败"})")});
+	check(!start() && !followUp.loginRequired, "a CSRF error alone does not expire the saved account");
+	bool loginRequired = false;
+	reset({signInRequired});
+	check(!Api::registerRealnameChallenge(config, "fixture-voucher", realname, message, &loginRequired) &&
+		      loginRequired && realname.qrUrl.empty(),
+	      "official verification registration reports an expired login without producing a challenge");
+	reset({signInRequired});
+	check(!Api::isUserIdentifiedByFaceAuth(config, 60024, identified, message, &loginRequired) && loginRequired,
+	      "the room verification query reports explicit login expiry");
 	reset({timedOut});
-	check(!start() && followUp.versionTimedOut && requests.size() == 1 &&
+	check(!start() && followUp.versionTimedOut && !followUp.loginRequired &&
+		      requests.size() == 1 &&
 		      requests.front().method == "GET" && requests.front().headers.back() == "Cookie: " + originalCookies,
 	      "version timeout allows retry before any start POST");
 	reset({version, timedOut});
-	check(!start() && !followUp.versionTimedOut && requests.size() == 2,
+	check(!start() && !followUp.versionTimedOut && !followUp.loginRequired && requests.size() == 2,
 	      "an ambiguous POST timeout is not classified as a retryable version GET timeout");
 	const auto latestVersion = reply(R"({"code":0,"data":{"build":456,"curr_version":"latest-fixture"}})");
 	reset({latestVersion, started});
@@ -278,6 +298,30 @@ int main(int argc, char **argv)
 	reset({reply(R"({"code":0,"data":{}})")});
 	check(!Api::getLiveStatus(config, live, message) && !live,
 	      "missing live status remains unknown instead of confirming a stopped room");
+	Bili::RoomInfo roomInfo;
+	reset({signInRequired});
+	check(!Api::getCurrentRoomInfo(config, roomInfo, message, &loginRequired) && loginRequired,
+	      "explicit room-info authentication failure is visible to the start workflow");
+	reset({timedOut});
+	check(!Api::getCurrentRoomInfo(config, roomInfo, message, &loginRequired) && !loginRequired,
+	      "a room-info timeout does not ask the user to sign in");
+	reset({reply(R"({"code":0,"data":{"by_room_ids":{"42":{"room_id":42,"uid":43,"area_id":86}}}})")});
+	check(!Api::getCurrentRoomInfo(config, roomInfo, message, &loginRequired) && !loginRequired,
+	      "a cached room owned by another account cannot proceed to start");
+	reset({reply(
+		R"({"code":0,"data":{"by_room_ids":{"42":{"room_id":42,"area_id":86,"parent_area_id":2,"live_status":1}}}})")});
+	check(Api::getCurrentRoomInfo(config, roomInfo, message) && roomInfo.live_status == 1 &&
+		      roomInfo.area_id == 86 && roomInfo.part_id == 2 && requests.size() == 1,
+	      "one room snapshot supplies both live status and category for a matched room");
+	for (const auto *body : {
+		     R"({"code":0,"data":{"by_room_ids":{"42":{"room_id":42,"area_id":86}}}})",
+		     R"({"code":0,"data":{"by_room_ids":{"42":{"room_id":42,"area_id":86,"live_status":3}}}})",
+		     R"({"code":0,"data":{"by_room_ids":{"43":{"room_id":43,"area_id":86,"live_status":0}}}})"}) {
+		reset({reply(body)});
+		check(Api::getCurrentRoomInfo(config, roomInfo, message) && roomInfo.live_status < 0 &&
+			      roomInfo.area_id == 86,
+		      "missing, invalid or other-room status requires a separate status lookup");
+	}
 
 	Bili::Config account = config;
 	account.login_status = true;
@@ -288,6 +332,26 @@ int main(int argc, char **argv)
 	account.sync_obs_start = false;
 	account.proxy_unlocked = true;
 	const std::string nextCookies = "SESSDATA=next-fixture; bili_jct=next-csrf; DedeUserID=43";
+	reset({});
+	auto restored = config;
+	restored.csrf_token.clear();
+	check(Core::restoreSavedAccount(restored) && restored.login_status && restored.room_id == "42" &&
+		      restored.csrf_token == "fixture-csrf" && requests.empty() &&
+		      Core::controlState(false, restored.login_status, !restored.room_id.empty(), true).streamToggleEnabled,
+	      "saved login enables the start button without any API call");
+	auto mismatched = restored;
+	mismatched.cookies = nextCookies;
+	check(!Core::restoreSavedAccount(mismatched) && !mismatched.login_status && !mismatched.cookies.empty(),
+	      "a mismatched cached account requires a refresh without discarding the cookie");
+	auto missingRoom = restored;
+	missingRoom.room_id = "0";
+	check(!Core::restoreSavedAccount(missingRoom) && !missingRoom.login_status && requests.empty(),
+	      "a missing cached room does not trigger a startup request");
+	const auto expired = Core::expiredAccount(account, {});
+	check(expired.requestSucceeded && !expired.loggedIn && expired.config.cookies.empty() &&
+		      expired.config.room_id.empty() && expired.config.last_rtmp_key.empty() &&
+		      expired.config.selected_rtmp_address == account.selected_rtmp_address,
+	      "discarding a reported expired login clears credentials and preserves the public route preference");
 	const auto next = Core::prepareAccountLogin(account, nextCookies);
 	check(next.room_id.empty() && next.title.empty() && next.area_id == 0 && next.part_id == 0 &&
 		      next.last_rtmp_key.empty() && next.selected_rtmp_address.empty() && !next.managed_session &&
@@ -296,37 +360,44 @@ int main(int argc, char **argv)
 	const auto nav42 = reply(R"({"code":0,"data":{"isLogin":true,"mid":42}})");
 	const auto nav43 = reply(R"({"code":0,"data":{"isLogin":true,"mid":43}})");
 	const auto room42 = reply(R"({"code":0,"data":{"room_id":42}})");
-	reset({nav43, reply(R"({"code":0,"data":{"room_id":0}})")});
+	const auto offlineWithoutRoom = reply(R"({"code":0,"data":{"liveStatus":0}})");
+	reset({nav43, offlineWithoutRoom, reply(R"({"code":0,"data":{"room_id":0}})")});
 	auto state = Core::queryAccountState(next);
 	check(state.requestSucceeded && state.loggedIn && !state.roomAvailable && state.config.room_id.empty() &&
 		      state.config.last_rtmp_key.empty() && state.message.find("尚未开通直播间") != std::string::npos &&
-		      requests.size() == 2,
+		      requests.size() == 3,
 	      "signed-in account without a room receives actionable feedback and never queries an old room");
 	const auto same = Core::prepareAccountLogin(account, complete);
 	check(same.selected_rtmp_address == account.selected_rtmp_address && same.last_rtmp_key.empty(),
 	      "same-account login retains route preference without retaining an old publish key");
-	reset({nav42, room42, reply(R"({"code":0,"data":{"liveStatus":0}})")});
+	reset({nav42, reply(R"({"code":0,"data":{"roomid":42,"liveStatus":0}})")});
 	state = Core::queryAccountState(same);
 	check(state.loggedIn && state.roomAvailable && state.liveStatusKnown && !state.isLive &&
-		      state.config.selected_rtmp_address == account.selected_rtmp_address && state.message.empty(),
-	      "same-account verified login preserves route preference and enables a confirmed room");
-	reset({nav42, timedOut, room42, reply(R"({"code":0,"data":{"liveStatus":0}})")});
+		      state.config.selected_rtmp_address == account.selected_rtmp_address && state.message.empty() &&
+		      requests.size() == 2 && requests.back().url.find("getRoomInfoOld") != std::string::npos,
+	      "verified login loads the room ID and current status in one request and preserves route preference");
+	reset({nav42, offlineWithoutRoom, timedOut, room42});
 	state = Core::queryAccountState(same);
 	check(state.loggedIn && state.roomAvailable && state.config.room_id == "42" && requests.size() == 4 &&
-		      requests[1].url == requests[2].url && requests[2].method == "GET",
+		      state.liveStatusKnown && requests[2].url == requests[3].url && requests[3].method == "GET",
 	      "a single room lookup timeout retries the read-only request and recovers without a new login");
-	reset({nav42, timedOut, timedOut});
+	reset({nav42, timedOut, room42});
+	state = Core::queryAccountState(same);
+	check(state.loggedIn && state.roomAvailable && !state.liveStatusKnown && state.config.room_id == "42" &&
+		      state.message.find("查询直播状态超时") != std::string::npos && requests.size() == 3,
+	      "a status timeout still discovers the room without repeating the timed-out status request");
+	reset({nav42, offlineWithoutRoom, timedOut, timedOut});
 	state = Core::queryAccountState(same);
 	check(state.loggedIn && !state.roomAvailable && state.message.find("获取房间号超时") != std::string::npos &&
-		      requests.size() == 3,
+		      requests.size() == 4,
 	      "repeated room lookup timeouts stop after one retry and retain login state");
-	reset({nav42, reply(R"({"code":-500,"message":"room lookup unavailable"})")});
+	reset({nav42, offlineWithoutRoom, reply(R"({"code":-500,"message":"room lookup unavailable"})")});
 	state = Core::queryAccountState(same);
 	check(state.loggedIn && !state.roomAvailable && state.config.room_id.empty() &&
-		      state.message.find("登录成功") != std::string::npos && requests.size() == 2,
+		      state.message.find("登录成功") != std::string::npos && requests.size() == 3,
 	      "partial room lookup failure retains authentication but disables unavailable room actions");
 	account.managed_session = true;
-	reset({nav42, {}});
+	reset({nav42, {}, {}});
 	state = Core::queryAccountState(Core::prepareAccountLogin(account, complete));
 	check(state.config.managed_session && state.config.room_id == account.room_id &&
 		      state.config.last_rtmp_key == account.last_rtmp_key,

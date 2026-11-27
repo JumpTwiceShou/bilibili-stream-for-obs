@@ -4,8 +4,10 @@
 
 本仓库公开发布版本从 `1.0.0` 开始。使用方式整体参考 [Zarosmm/obs-bilibili-stream](https://github.com/Zarosmm/obs-bilibili-stream)，并融合了 [lanyangyin/OBSscripts-bilibili-live](https://github.com/lanyangyin/OBSscripts-bilibili-live) 中与 OBS 前端事件同步相关的思路。
 
-## 1.3.4 更新
+## 1.3.5 更新
 
+- OBS 启动时直接恢复上次保存的账号和直播间，可以立即点击开播。
+- 开播时合并房间状态和分区查询。B 站明确提示未登录或登录过期时，插件会引导重新扫码。
 - B 站要求实名认证时，插件在原生窗口显示本次验证二维码，等待 B 站确认后自动重试开播。
 - 获取直播版本超时后可在原窗口重试。登录菜单新增「刷新登录与直播间状态」。
 - 开播失败时后台检查插件更新，有新版本即可进入 GitHub 最新发布页。

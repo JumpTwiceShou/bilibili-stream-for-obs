@@ -20,7 +20,7 @@ struct ControlState {
 	bool refreshRoomEnabled = false;
 };
 
-enum class FaceAuthRetryDecision { Started, ContinueWaiting, ChallengeChanged, VersionTimedOut, Failed };
+enum class FaceAuthRetryDecision { Started, ContinueWaiting, ChallengeChanged, VersionTimedOut, LoginRequired, Failed };
 
 class FaceAuthRetryPolicy {
 public:
@@ -40,6 +40,7 @@ std::string encodeFormComponent(const std::string &value);
 std::string buildFormBody(const std::vector<std::pair<std::string, std::string>> &params);
 bool jsonInteger(const json11::Json &value, int &result, int minimum = 0);
 bool apiResponseCode(const json11::Json &response, int &code);
+bool apiLoginRequired(const json11::Json &response, int code);
 std::string newerReleaseVersion(const json11::Json &release, const std::string &installedVersion);
 std::string apiErrorMessage(const json11::Json &response, const std::string &action);
 bool faceAuthIdentified(const json11::Json &response, bool &identified);

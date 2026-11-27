@@ -264,7 +264,8 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 			}
 			timer.stop();
 			if (decision == Core::FaceAuthRetryDecision::Started ||
-			    decision == Core::FaceAuthRetryDecision::ChallengeChanged)
+			    decision == Core::FaceAuthRetryDecision::ChallengeChanged ||
+			    decision == Core::FaceAuthRetryDecision::LoginRequired)
 				guard->accept();
 			else {
 				statusLabel->setText(text("Dialog.StartFailed"));
@@ -285,10 +286,15 @@ bool DialogFactory::faceAuth(QWidget *parent, const std::string &faceUrl, FacePo
 			if (!guard)
 				return;
 			state->inFlight = false;
+			using Status = Bili::FaceAuthStatus;
+			if (status == Status::LoginRequired) {
+				timer.stop();
+				guard->accept();
+				return;
+			}
 			if (expire()) {
 				return;
 			}
-			using Status = Bili::FaceAuthStatus;
 			if (status == Status::Expired) {
 				showExpired();
 				return;
